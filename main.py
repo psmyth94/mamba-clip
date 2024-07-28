@@ -1,19 +1,25 @@
 # type: ignore
+import argparse
+import copy
 import glob
 import json
 import logging
 import math
 import multiprocessing
+import numbers
 import os
 import random
 import re
 import subprocess
+import sys
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from collections.abc import Iterator, Sequence
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from functools import partial
 from io import BytesIO, TextIOWrapper
-from typing import Any, Dict, Iterator, List, Optional, TypeVar
+from typing import Any, Dict, List, Optional, Type, Union
 
 import fsspec
 import h5py
@@ -27,21 +33,26 @@ from open_clip import (
     AugmentationCfg,
     CustomTextCLIP,
     SimpleTokenizer,
-    create_model_and_transforms,
     create_model_from_pretrained,
     get_tokenizer,
     trace_model,
 )
+from open_clip.constants import OPENAI_DATASET_MEAN, OPENAI_DATASET_STD
 from open_clip.tokenizer import HFTokenizer
-from open_clip.transform import PreprocessCfg, image_transform_v2
+from open_clip.transform import PreprocessCfg
 from open_clip_train.scheduler import const_lr, const_lr_cooldown, cosine_lr
 from open_clip_train.train import backward, unwrap_model
 from PIL import Image
 from sklearn.metrics import auc, roc_curve
-from torch import optim
+from sklearn.utils.class_weight import compute_class_weight
+from timm.data import create_transform
+from timm.data.transforms import CenterCropOrPad, ResizeKeepRatio
+from torch import Tensor, optim
 from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, Sampler
+from torch.utils.data.sampler import WeightedRandomSampler
 from torchvision import transforms
+from torchvision.transforms.transforms import InterpolationMode
 from tqdm.auto import tqdm
 from transformers.convert_slow_tokenizer import Tokenizer
 
@@ -78,94 +89,6 @@ class AverageMeter(object):
 
 
 @dataclass
-class Args:
-    data_path: str
-    val_data_path: Optional[str] = None
-    train_num_samples: Optional[int] = None
-    val_num_samples: Optional[int] = None
-    num_classes: int = None
-    dataset_type: str = "auto"
-    device: str = "auto"
-    csv_separator: str = "\t"
-    csv_img_key: str = "filepath"
-    csv_caption_key: str = "title"
-    imagenet_val: Optional[str] = None
-    imagenet_v2: Optional[str] = None
-    logs: str = "./logs/"
-    log_local: bool = False
-    name: Optional[str] = None
-    workers: int = 4
-    batch_size: int = 64
-    epochs: int = 3
-    epochs_cooldown: Optional[int] = None
-    lr: Optional[float] = 1e-4
-    beta1: Optional[float] = None
-    beta2: Optional[float] = None
-    eps: Optional[float] = None
-    wd: float = 0.2
-    warmup: int = 10000
-    use_bn_sync: bool = False
-    skip_scheduler: bool = False
-    lr_scheduler: str = "cosine"
-    lr_cooldown_end: float = 0.0
-    lr_cooldown_power: float = 1.0
-    save_frequency: int = 1
-    save_most_recent: bool = False
-    zeroshot_frequency: int = 2
-    val_frequency: int = 1
-    resume: Optional[str] = None
-    precision: str = "amp"
-    model: str = "BioMedCLIP-PubMedBERT_256-vit_base_patch16_224"
-    pretrained: str = ""
-    pretrained_image: bool = False
-    lock_image: bool = False
-    lock_image_unlocked_groups: int = 0
-    lock_image_freeze_bn_stats: bool = False
-    image_mean: Optional[List[float]] = None
-    image_std: Optional[List[float]] = None
-    image_interpolation: Optional[str] = None
-    image_resize_mode: Optional[str] = None
-    aug_cfg: Optional[List[str]] = field(default_factory=list)
-    grad_checkpointing: bool = False
-    local_loss: bool = False
-    gather_with_grad: bool = False
-    force_image_size: Optional[List[int]] = None
-    force_quick_gelu: bool = False
-    force_patch_dropout: Optional[float] = None
-    force_custom_text: bool = False
-    torchscript: bool = False
-    torchcompile: bool = False
-    trace: bool = False
-    accum_freq: int = 1
-    dist_url: str = "env://"
-    dist_backend: str = "nccl"
-    report_to: str = ""
-    wandb_notes: str = ""
-    wandb_project_name: str = "open-clip"
-    debug: bool = False
-    copy_codebase: bool = False
-    ddp_static_graph: bool = False
-    no_set_device_rank: bool = False
-    seed: int = 0
-    grad_clip_norm: Optional[float] = None
-    lock_text: bool = False
-    lock_text_unlocked_layers: int = 0
-    lock_text_freeze_layer_norm: bool = False
-    log_every_n_steps: int = 100
-    coca_caption_loss_weight: float = 2.0
-    coca_contrastive_loss_weight: float = 1.0
-    distributed: bool = False
-    remote_sync: Optional[str] = None
-    remote_sync_frequency: int = 300
-    remote_sync_protocol: str = "fsspec"
-    delete_previous_checkpoint: bool = False
-    distill_model: Optional[str] = None
-    distill_pretrained: Optional[str] = None
-    use_bnb_linear: Optional[str] = None
-    siglip: bool = False
-
-
-@dataclass
 class DataInfo:
     dataloader: DataLoader
     sampler: Optional[Sampler] = None
@@ -176,6 +99,15 @@ class DataInfo:
             self.shared_epoch.set_value(epoch)
         if self.sampler is not None and hasattr(self.sampler, "set_epoch"):
             self.sampler.set_epoch(epoch)
+
+
+def cross_entropy_loss(
+    input: torch.Tensor, target: torch.Tensor, weight=None
+) -> torch.Tensor:
+    target_is_float = target.dtype in (torch.float, torch.double)
+    if target_is_float:
+        return -(input.log_softmax(dim=-1) * target).sum(dim=-1).mean()
+    return F.cross_entropy(input, target, weight=weight)
 
 
 class ClipLoss(torch.nn.Module):
@@ -237,14 +169,14 @@ class ClipLoss(torch.nn.Module):
 
         return logits_per_image, logits_per_text
 
-    # def _gather_labels(self, labels):
-    #     if self.world_size > 1:
-    #         gathered_labels = [torch.zeros_like(labels) for _ in range(self.world_size)]
-    #         dist.all_gather(gathered_labels, labels)
-    #         if not self.local_loss:
-    #             gathered_labels[self.rank] = labels
-    #         return torch.cat(gathered_labels, dim=0)
-    #     return labels
+    def _gather_labels(self, labels):
+        if self.world_size > 1:
+            gathered_labels = [torch.zeros_like(labels) for _ in range(self.world_size)]
+            dist.all_gather(gathered_labels, labels)
+            if not self.local_loss:
+                gathered_labels[self.rank] = labels
+            return torch.cat(gathered_labels, dim=0)
+        return labels
 
     def forward(
         self,
@@ -259,10 +191,10 @@ class ClipLoss(torch.nn.Module):
             image_features, text_features, logit_scale
         )
 
-        if target is not None:
-            labels = self._gather_labels(target)
-        else:
-            labels = self.get_ground_truth(device, logits_per_image.shape[0])
+        # if target is not None:
+        # labels = self._gather_labels(target)
+        # else:
+        labels = self.get_ground_truth(device, logits_per_image.shape[0])
 
         total_loss = (
             F.cross_entropy(logits_per_image, labels)
@@ -272,15 +204,211 @@ class ClipLoss(torch.nn.Module):
         return {"contrastive_loss": total_loss} if output_dict else total_loss
 
 
+class ComboIter(object):
+    """An iterator."""
+
+    def __init__(self, my_loader):
+        self.my_loader = my_loader
+        self.loader_iters = [iter(loader) for loader in self.my_loader.loaders]
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        # When the shortest loader (the one with minimum number of batches)
+        # terminates, this iterator will terminates.
+        # The `StopIteration` raised inside that shortest loader's `__next__`
+        # method will in turn gets out of this `__next__` method.
+        batches = [next(loader_iter) for loader_iter in self.loader_iters]
+        return self.my_loader.combine_batch(batches)
+
+    def __len__(self):
+        return len(self.my_loader)
+
+
+class ComboLoader(object):
+    """This class wraps several pytorch DataLoader objects, allowing each time
+    taking a batch from each of them and then combining these several batches
+    into one. This class mimics the `for batch in loader:` interface of
+    pytorch `DataLoader`.
+    Args:
+    loaders: a list or tuple of pytorch DataLoader objects
+    """
+
+    def __init__(self, loaders):
+        self.loaders = loaders
+        self.dataset = loaders[0].dataset
+
+    def __iter__(self):
+        return ComboIter(self)
+
+    def __len__(self):
+        return min([len(loader) for loader in self.loaders])
+
+    # Customize the behavior of combining batches here.
+    def combine_batch(self, batches):
+        return batches
+
+
+def get_sampling_probabilities(class_count, mode="instance", ep=None, n_eps=None):
+    """
+    Note that for progressive sampling I use n_eps-1, which I find more intuitive.
+    If you are training for 10 epochs, you pass n_eps=10 to this function. Then, inside
+    the training loop you would have sth like 'for ep in range(n_eps)', so ep=0,...,9,
+    and all fits together.
+    """
+    if mode == "instance":
+        q = 0
+    elif mode == "class":
+        q = 1
+    elif mode == "sqrt":
+        q = 0.5  # 1/2
+    elif mode == "cbrt":
+        q = 0.125  # 1/8
+    elif mode == "prog":
+        assert (
+            ep != None and n_eps != None
+        ), "progressive sampling requires to pass values for ep and n_eps"
+        relative_freq_imbal = class_count**0 / (class_count**0).sum()
+        relative_freq_bal = class_count**1 / (class_count**1).sum()
+        sampling_probabilities_imbal = relative_freq_imbal ** (-1)
+        sampling_probabilities_bal = relative_freq_bal ** (-1)
+        return (1 - ep / (n_eps - 1)) * sampling_probabilities_imbal + (
+            ep / (n_eps - 1)
+        ) * sampling_probabilities_bal
+    else:
+        sys.exit("not a valid mode")
+
+    relative_freq = class_count**q / (class_count**q).sum()
+    sampling_probabilities = relative_freq ** (-1)
+
+    return sampling_probabilities
+
+
+def modify_loader(loader, mode, ep=None, n_eps=None, distributed=False):
+    class_count = np.unique(loader.dataset.targets, return_counts=True)[1]
+    sampling_probs = get_sampling_probabilities(
+        class_count, mode=mode, ep=ep, n_eps=n_eps
+    )
+    sample_weights = sampling_probs[loader.dataset.targets]
+
+    if distributed:
+        mod_sampler = DistributedWeightedRandomSampler(
+            weights=sample_weights, num_samples=len(sample_weights)
+        )
+    else:
+        mod_sampler = WeightedRandomSampler(
+            weights=sample_weights, num_samples=len(sample_weights)
+        )
+    mod_loader = DataLoader(
+        loader.dataset,
+        batch_size=loader.batch_size,
+        sampler=mod_sampler,
+        num_workers=loader.num_workers,
+    )
+    return mod_loader, mod_sampler
+
+
+def get_combo_loader(loader, base_sampling="instance", distributed=False):
+    if base_sampling == "instance":
+        imbalanced_loader = loader
+    else:
+        imbalanced_loader, _ = modify_loader(
+            loader, mode=base_sampling, distributed=distributed
+        )
+
+    balanced_loader, _ = modify_loader(loader, mode="class", distributed=distributed)
+    combo_loader = ComboLoader([imbalanced_loader, balanced_loader])
+    return combo_loader
+
+
+class DistributedWeightedRandomSampler(DistributedSampler):
+    def __init__(
+        self,
+        weights: Sequence[float],
+        num_samples: int,
+        replacement=True,
+        num_replicas: Optional[int] = None,
+        rank: Optional[int] = None,
+        shuffle: bool = True,
+        seed: int = 0,
+        drop_last: bool = False,
+    ) -> None:
+        if num_replicas is None:
+            if not dist.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            num_replicas = dist.get_world_size()
+        if rank is None:
+            if not dist.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            rank = dist.get_rank()
+        if rank >= num_replicas or rank < 0:
+            raise ValueError(
+                f"Invalid rank {rank}, rank should be in the interval [0, {num_replicas - 1}]"
+            )
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.epoch = 0
+        self.drop_last = drop_last
+        self.dataset_size = num_samples
+        # If the dataset length is evenly divisible by # of replicas, then there
+        # is no need to drop any data, since the dataset will be split equally.
+        if self.drop_last and num_samples % self.num_replicas != 0:  # type: ignore[arg-type]
+            # Split to nearest available length that is evenly divisible.
+            # This is to ensure each rank receives the same amount of data when
+            # using this Sampler.
+            self.num_samples = math.ceil(
+                (num_samples - self.num_replicas) / self.num_replicas  # type: ignore[arg-type]
+            )
+        else:
+            self.num_samples = math.ceil(num_samples / self.num_replicas)  # type: ignore[arg-type]
+        self.total_size = self.num_samples * self.num_replicas
+        self.shuffle = shuffle
+        self.seed = seed
+        self.weights = np.array(weights)
+        self.replacement = replacement
+
+    def __iter__(self):
+        if self.shuffle:
+            # deterministically shuffle based on epoch and seed
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            indices = torch.randperm(self.dataset_size, generator=g).tolist()  # type: ignore[arg-type]
+        else:
+            indices = list(range(self.dataset_size))  # type: ignore[arg-type]
+
+        if not self.drop_last:
+            # add extra samples to make it evenly divisible
+            padding_size = self.total_size - len(indices)
+            if padding_size <= len(indices):
+                indices += indices[:padding_size]
+            else:
+                indices += (indices * math.ceil(padding_size / len(indices)))[
+                    :padding_size
+                ]
+        else:
+            # remove tail of data to make it evenly divisible.
+            indices = indices[: self.total_size]
+        assert len(indices) == self.total_size
+
+        # subsample
+        weights = self.weights[np.array(indices)]
+        weighted_indices = list(
+            WeightedRandomSampler(weights, len(weights), self.replacement)
+        )
+        indices = [indices[wi] for wi in weighted_indices]
+        indices = indices[self.rank : self.total_size : self.num_replicas]
+        return iter(indices)
+
+
 class IsicChallengeDataset(Dataset):
     def __init__(
         self,
         data_path: str,
         metadata_or_path: str,
-        tokenizer: SimpleTokenizer | HFTokenizer | Tokenizer = None,
+        tokenizer: Union[SimpleTokenizer, HFTokenizer, Tokenizer] = None,
         transform: Optional[transforms.Compose] = None,
         is_train: bool = False,
-        upsample: bool = None,
         small_test: bool = False,
     ):
         """
@@ -314,10 +442,6 @@ class IsicChallengeDataset(Dataset):
         else:
             self.targets = None
 
-        self.upsample = upsample if upsample is not None else (is_train or small_test)
-        if self.upsample and self.targets is not None:
-            self.indices, self.targets = self._get_class_indices(small_test)
-
         # Open the HDF5 file
         self.hdf5_file = None
         if data_path.endswith(".h5") or data_path.endswith(".hdf5"):
@@ -326,40 +450,6 @@ class IsicChallengeDataset(Dataset):
 
         self.is_train = is_train
         self.small_test = small_test
-
-    def _get_class_indices(self, small_test: bool = False) -> List[int]:
-        class_ids = defaultdict(list)
-        class_indices = defaultdict(list)
-        for idx, (ids, class_label) in enumerate(zip(self.indices, self.targets)):
-            class_ids[class_label].append(ids)
-            class_indices[class_label].append(idx)
-
-        balanced_ids, balanced_targets = [], []
-        max_class_size = max([len(indices) for indices in class_ids.values()])
-
-        for class_label in class_ids:
-            indices = class_indices[class_label]
-            ids = class_ids[class_label]
-            if len(ids) < max_class_size:
-                oversampled_indices = np.random.choice(
-                    indices, size=max_class_size - len(indices), replace=True
-                ).tolist()
-                if small_test:
-                    oversampled_indices = oversampled_indices[:10]
-                else:
-                    oversampled_indices = indices + oversampled_indices
-                new_ids = [self.indices[idx] for i in oversampled_indices]
-                new_targets = [self.targets[idx] for idx in oversampled_indices]
-            elif small_test:
-                new_ids = ids[:10]
-                new_targets = [self.targets[idx] for idx in indices[:10]]
-            else:
-                new_ids = ids
-                new_targets = [self.targets[idx] for idx in indices]
-            balanced_ids.extend(new_ids)
-            balanced_targets.extend(new_targets)
-
-        return balanced_ids, balanced_targets
 
     def __len__(self):
         return len(self.indices)
@@ -398,10 +488,7 @@ class IsicChallengeDataset(Dataset):
         return tokens
 
     def __getitem__(self, idx):
-        if torch.is_tensor(idx):
-            ids = [self.indices[i] for i in idx.tolist()]
-        else:
-            ids = self.indices[idx]
+        ids = self.indices[idx]
 
         # Get image
         image = self._load_image(ids)
@@ -413,35 +500,20 @@ class IsicChallengeDataset(Dataset):
         neg_texts = []
 
         target_text = []
-        if isinstance(ids, list) or torch.is_tensor(ids):
-            for _, row in batch.iterrows():
-                if self.is_train:
-                    target_text.append(
-                        generate_report(row, is_eval=False, include_target=False)
-                    )
-                else:
-                    texts = generate_report(row, is_eval=True, include_target=False)
-                    if isinstance(texts, tuple):
-                        neg_txt, pos_txt = texts
-                        pos_texts.append(pos_txt)
-                        neg_texts.append(neg_txt)
-                        target_text.append(row["target"])
-                    else:
-                        target_text.append(texts)
+        if self.is_train:
+            target_text.append(
+                generate_report(batch, is_eval=False, include_target=False)
+            )
+
         else:
-            if self.is_train:
-                target_text.append(
-                    generate_report(batch, is_eval=False, include_target=False)
-                )
+            texts = generate_report(batch, is_eval=True, include_target=False)
+            if isinstance(texts, tuple):
+                neg_txt, pos_txt = texts
+                pos_texts.append(pos_txt)
+                neg_texts.append(neg_txt)
+                target_text.append(batch["target"])
             else:
-                texts = generate_report(batch, is_eval=True, include_target=False)
-                if isinstance(texts, tuple):
-                    neg_txt, pos_txt = texts
-                    pos_texts.append(pos_txt)
-                    neg_texts.append(neg_txt)
-                    target_text.append(batch["target"])
-                else:
-                    target_text.append(texts)
+                target_text.append(texts)
 
         targets = None
         if self.targets is not None:
@@ -492,6 +564,23 @@ class ClipModel(torch.nn.Module):
         text_features = (
             self.encode_text(text, normalize=True) if text is not None else None
         )
+
+        if not hasattr(self.visual, "output_dim") and image_features is not None:
+            self.visual.output_dim = image_features.shape[1:]
+            if (
+                isinstance(self.visual.output_dim, torch.Size)
+                and len(self.visual.output_dim) == 1
+            ):
+                self.visual.output_dim = self.visual.output_dim[0]
+
+        if not hasattr(self.text, "output_dim") and text_features is not None:
+            self.text.output_dim = text_features.shape[1:]
+            if (
+                isinstance(self.text.output_dim, torch.Size)
+                and len(self.text.output_dim) == 1
+            ):
+                self.text.output_dim = self.text.output_dim[0]
+
         secondary_text_features = None
         if secondary_text is not None:
             secondary_text_features = self.encode_text(secondary_text, normalize=True)
@@ -540,19 +629,6 @@ class ClipModel(torch.nn.Module):
             "embeddings",
             getattr(self.text.transformer, "embed_tokens", None),
         )
-        if layer_list is None:
-            logging.warning(
-                f"Could not find layer list in model of type {self.text.config.model_type}"
-            )
-            return
-        if embeddings is None:
-            logging.warning(
-                f"Could not find embeddings in model of type {self.text.config.model_type}"
-            )
-            return
-        logging.info(
-            f"Unlocking {unlocked_layers}/{len(layer_list) + 1} layers of hf model"
-        )
         modules = [embeddings, *layer_list][:-unlocked_layers]
         # freeze layers
         for module in modules:
@@ -573,19 +649,28 @@ class ClipModel(torch.nn.Module):
         if self.logit_bias is not None:
             image_logits += self.logit_bias
         text_logits = image_logits.T
+
         return image_logits, text_logits
 
 
 class ClipClassifier(torch.nn.Module):
-    def __init__(self, clip_model: ClipModel, feature_dim=None, num_classes: int = 2):
+    def __init__(
+        self,
+        clip_model: ClipModel,
+        feature_dim=None,
+        num_classes: int = 2,
+        use_visual_only=False,
+        use_text_only=False,
+        use_inner_prod=False,
+    ):
         super().__init__()
-        self.clip_model = unwrap_model(self.clip_model)
+        self.clip_model = unwrap_model(clip_model)
         self.num_classes = num_classes
 
         # Freeze the CLIP model parameters
         for param in self.clip_model.parameters():
             param.requires_grad = False
-        # Classification layer
+
         if feature_dim is None:
             image_feature_dim = getattr(
                 self.clip_model.visual,
@@ -605,16 +690,27 @@ class ClipClassifier(torch.nn.Module):
                     getattr(self.clip_model.text, "d_model", None),
                 ),
             )
+            logging.info(
+                f"Image feature dim: {image_feature_dim}, Text feature dim: {text_feature_dim}"
+            )
             if text_feature_dim is None or image_feature_dim is None:
-                with torch.no_grad():
-                    dummy_image = torch.randn(1, 3, 224, 224)
-                    dummy_text = torch.randint(0, 1000, (1, 77))
-                    features = self.clip_model(dummy_image, dummy_text)
-                    image_feature_dim = features["image_features"].shape[-1]
-                    text_feature_dim = features["text_features"].shape[-1]
+                raise ValueError(
+                    "Could not find image and text feature dimensions in the model"
+                )
             feature_dim = image_feature_dim + text_feature_dim
-
-        self.classifier = torch.nn.Linear(feature_dim, num_classes)
+        self.use_visual_only = use_visual_only
+        self.use_text_only = use_text_only
+        self.use_inner_prod = use_inner_prod
+        # if use_visual_only or use_text_only or use_inner_prod:
+        #     output_dim = feature_dim
+        # else:
+        #     output_dim = feature_dim // 2
+        # self.fc = torch.nn.Sequential(
+        #     torch.nn.Linear(feature_dim, output_dim),
+        #     torch.nn.ReLU(),
+        #     torch.nn.Linear(output_dim, num_classes),
+        # )
+        self.fc = torch.nn.Linear(feature_dim, num_classes)
 
     def forward(self, image, text):
         # Get CLIP features
@@ -622,12 +718,25 @@ class ClipClassifier(torch.nn.Module):
         image_features = clip_output["image_features"]
         text_features = clip_output["text_features"]
 
+        if self.use_visual_only:
+            return self.fc(image_features)
+        elif self.use_text_only:
+            return self.fc(text_features)
+        elif self.use_inner_prod:
+            return self.fc(image_features * text_features)
         # Concatenate image and text features
         combined_features = torch.cat((image_features, text_features), dim=1)
 
         # Classification
-        logits = self.classifier(combined_features)
+        logits = self.fc(combined_features)
 
+        return logits
+
+    def get_logits(self, image_features, text_features):
+        # compute the product of image and text features
+        logits = image_features * text_features
+        if self.clup_model.logit_bias is not None:
+            logits += self.logit_bias
         return logits
 
     def classify(self, image, text):
@@ -819,10 +928,12 @@ def setup_logging(log_file, level, include_host=False):
 
 def get_autocast(precision):
     if precision == "amp":
-        return torch.cuda.amp.autocast
+        device_type = "cuda" if torch.cuda.is_available() else "cpu"
+        return partial(torch.amp.autocast, device_type=device_type)
     elif precision == "amp_bfloat16" or precision == "amp_bf16":
         # amp_bfloat16 is more stable than amp float16 for clip training
-        return lambda: torch.cuda.amp.autocast(dtype=torch.bfloat16)
+        device_type = "cuda" if torch.cuda.is_available() else "cpu"
+        return lambda: torch.amp.autocast(device_type, dtype=torch.bfloat16)
     else:
         from contextlib import suppress
 
@@ -888,18 +999,20 @@ def generate_report(
     lesion_size_info = ""
     if not np.isnan(lesion_size):
         lesion_size_info = (
-            f"millimeters and a diameter of {lesion_size:.3f} millimeters. "
+            f"millimeters and a diameter of {round(lesion_size)} millimeters. "
         )
 
     area = row["tbp_lv_areaMM2"]
     area_info = ""
     if not np.isnan(area):
-        area_info = f"The lesion has an area of {area:.3f} square "
+        area_info = f"The lesion has an area of {round(area)} square millimeters. "
 
     perimeter = row["tbp_lv_perimeterMM"]
     perimeter_info = ""
     if not np.isnan(perimeter):
-        perimeter_info = f"The perimeter of the lesion is {perimeter:.3f} millimeters. "
+        perimeter_info = (
+            f"The perimeter of the lesion is {round(perimeter)} millimeters. "
+        )
 
     eccentricity = row["tbp_lv_eccentricity"]
     eccentricity_info = ""
@@ -913,7 +1026,7 @@ def generate_report(
     border_irregularity_info = ""
     if not np.isnan(border_irregularity):
         border_irregularity_info = (
-            f"Border irregularity is rated at {border_irregularity:.3f} on a scale of 0 to "
+            f"Border irregularity is rated at {round(border_irregularity)} on a scale of 0 to "
             "10. "
         )
 
@@ -921,7 +1034,7 @@ def generate_report(
     color_variation_info = ""
     if not np.isnan(color_variation):
         color_variation_info = (
-            f"Color variation within the lesion is rated at {color_variation:.3f} on a "
+            f"Color variation within the lesion is rated at {round(color_variation)} on a "
             "scale of 0 to 10. "
         )
 
@@ -965,30 +1078,95 @@ def generate_reports(metadata, path):
             generate_report(row, file)
 
 
-def init_model(aug_kwargs: Optional[Dict[str, Any]] = None):
-    if aug_kwargs is None:
-        aug_kwargs = {"use_timm": True}
+def get_transform(aug_cfg: AugmentationCfg, pp_cfg: PreprocessCfg, is_train: bool):
+    interpolation = pp_cfg.interpolation
+    image_size = pp_cfg.size
+    fill_color = pp_cfg.fill_color
+
+    mean = pp_cfg.mean or OPENAI_DATASET_MEAN
+    if not isinstance(mean, (list, tuple)):
+        mean = (mean,) * 3
+
+    std = pp_cfg.std or OPENAI_DATASET_STD
+    if not isinstance(std, (list, tuple)):
+        std = (std,) * 3
+
+    interpolation = interpolation or "bicubic"
+    assert interpolation in ["bicubic", "bilinear", "random"]
+
+    interpolation = interpolation or "bicubic"
+    assert interpolation in ["bicubic", "bilinear", "random"]
+    # NOTE random is ignored for interpolation_mode, so defaults to BICUBIC for inference if set
+    interpolation_mode = (
+        InterpolationMode.BILINEAR
+        if interpolation == "bilinear"
+        else InterpolationMode.BICUBIC
+    )
+    normalize = transforms.Normalize(mean=mean, std=std)
+    if is_train:
+        if isinstance(aug_cfg, dict):
+            aug_cfg = AugmentationCfg(**aug_cfg)
+        else:
+            aug_cfg = aug_cfg or AugmentationCfg()
+
+        if isinstance(image_size, (tuple, list)):
+            assert len(image_size) >= 2
+            input_size = (3,) + image_size[-2:]
+        else:
+            input_size = (3, image_size, image_size)
+
+        aug_cfg_dict = {k: v for k, v in asdict(aug_cfg).items() if v is not None}
+
+        # not appropriate with medical images
+        aug_cfg_dict.setdefault("color_jitter", None)
+        aug_cfg_dict.pop("color_jitter_prob", None)
+        aug_cfg_dict.pop("gray_scale_prob", None)
+        aug_cfg_dict.pop("use_timm", None)
+        hflip = aug_cfg_dict.get("horizontal_flip", 0.5)
+
+        return create_transform(
+            input_size=input_size,
+            is_training=True,
+            hflip=hflip,
+            mean=mean,
+            std=std,
+            re_mode="pixel",
+            interpolation=interpolation,
+            **aug_cfg_dict,
+        )
+
+    interpolation_mode = "bilinear" if interpolation == "random" else interpolation
+    pipe = [
+        ResizeKeepRatio(image_size, interpolation=interpolation_mode, longest=1),
+        CenterCropOrPad(image_size, fill=fill_color),
+        lambda x: x.convert("RGB"),
+        transforms.ToTensor(),
+        normalize,
+    ]
+    return transforms.Compose(pipe)
+
+
+def init_model(model, tokenizer=None, aug_cfg: Optional[Dict[str, Any]] = None):
     # device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model, _ = create_model_from_pretrained(
-        "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
-    )  # type: ignore
-    tokenizer = get_tokenizer(
-        "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
-    )
-    pp_cfg = PreprocessCfg(**model.visual.preprocess_cfg)
+    if isinstance(model, str):
+        tokenizer = tokenizer or model
+        model, _ = create_model_from_pretrained(f"hf-hub:{model}")
+    elif callable(model):
+        model = model()
 
-    aug_cfg = AugmentationCfg(**aug_kwargs)
-    preprocess_train = image_transform_v2(
-        pp_cfg,
-        is_train=True,
-        aug_cfg=aug_cfg,
-    )
-    preprocess_val = image_transform_v2(
-        pp_cfg,
-        is_train=False,
-    )
-    return model, preprocess_train, preprocess_val, tokenizer
+    if isinstance(tokenizer, str):
+        tokenizer = get_tokenizer(f"hf-hub:{tokenizer}")
+    elif callable(tokenizer):
+        tokenizer = tokenizer()
+
+    pp_cfg = None
+    if hasattr(model, "visual") and hasattr(model.visual, "preprocess_cfg"):
+        pp_cfg = PreprocessCfg(**model.visual.preprocess_cfg)
+
+    preprocess_train = get_transform(aug_cfg, pp_cfg, is_train=True)
+    preprocess_val = get_transform(aug_cfg, pp_cfg, is_train=False)
+    return ClipModel(model), preprocess_train, preprocess_val, tokenizer
 
 
 def random_seed(seed=42, rank=0):
@@ -1045,6 +1223,26 @@ def pt_load(file_path, map_location=None):
     with of as f:
         out = torch.load(f, map_location=map_location)
     return out
+
+
+def load_checkpoint(args, checkpoint, model, optimizer=None, scaler=None):
+    if "epoch" in checkpoint:
+        # resuming a train checkpoint w/ epoch and optimizer state
+        start_epoch = checkpoint["epoch"]
+        sd = checkpoint["state_dict"]
+        if not args.distributed and next(iter(sd.items()))[0].startswith("module"):
+            sd = {k[len("module.") :]: v for k, v in sd.items()}
+        model.load_state_dict(sd, strict=False)
+        if optimizer is not None:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        if scaler is not None and "scaler" in checkpoint:
+            scaler.load_state_dict(checkpoint["scaler"])
+        logging.info(f"=> resuming checkpoint '{args.resume}' (epoch {start_epoch})")
+    else:
+        # loading a bare (model only) checkpoint for fine-tune or evaluation
+        model.load_state_dict(checkpoint)
+        logging.info(f"=> loaded checkpoint '{args.resume}' (epoch {start_epoch})")
+    return model, optimizer, scaler, start_epoch
 
 
 def start_sync_process(sync_every, local_dir, remote_dir, protocol):
@@ -1165,6 +1363,7 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
             for i, batch in enumerate(dataloader):
                 images, texts, targets = batch
                 images = images.to(device=device, dtype=input_dtype, non_blocking=True)
+                texts = texts.to(device=device, non_blocking=True)
                 targets = targets.to(device=device, non_blocking=True)
                 all_targets.append(targets.cpu())
 
@@ -1203,7 +1402,7 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
 
                 cumulative_loss += total_loss * batch_size
                 num_samples += batch_size
-                if is_master(args) and (i % 100) == 0:
+                if is_master(args) and (i % args.log_every_n_steps) == 0:
                     logging.info(
                         f"Eval Epoch: {epoch} [{num_samples} / {samples_per_val}]\t"
                         f"Loss: {cumulative_loss / num_samples:.6f}\t"
@@ -1263,17 +1462,15 @@ def train_one_epoch(
     optimizer,
     scaler,
     scheduler,
-    dist_model,
     args,
     tb_writer=None,
 ):
     device = torch.device(args.device)
     autocast = get_autocast(args.precision)
     input_dtype = get_input_dtype(args.precision)
+    model = model.to(device=device)
 
     model.train()
-    if args.distill:
-        dist_model.eval()
 
     data["train"].set_epoch(
         epoch
@@ -1296,7 +1493,18 @@ def train_one_epoch(
         if not args.skip_scheduler:
             scheduler(step)
 
-        images, texts, targets = batch
+        if args.balanced_mixup:
+            images, texts, targets = batch[0][0], batch[0][1], batch[0][2]
+            balanced_images, balanced_texts, balanced_targets = (
+                batch[1][0],
+                batch[1][1],
+                batch[1][2],
+            )
+            balanced_images = balanced_images.to(device=device, dtype=input_dtype)
+            balanced_texts = balanced_texts.to(device=device)
+            balanced_targets = balanced_targets.to(device=device)
+        else:
+            images, texts, targets = batch
         images = images.to(device=device, dtype=input_dtype, non_blocking=True)
         texts = texts.to(device=device, non_blocking=True)
         targets = targets.to(device=device, non_blocking=True)
@@ -1306,6 +1514,22 @@ def train_one_epoch(
 
         if args.accum_freq == 1:
             with autocast():
+                if args.balanced_mixup:
+                    lam = np.random.beta(a=args.balanced_mixup, b=1)
+
+                    images = (1 - lam) * images + lam * balanced_images
+                    if lam > 0.5:
+                        texts = balanced_texts
+
+                    n_classes = args.num_classes
+                    targets = F.one_hot(targets, n_classes)
+                    targets = (1 - lam) * targets + lam * F.one_hot(
+                        balanced_targets, n_classes
+                    )
+                    del balanced_images
+                    del balanced_texts
+                    del balanced_targets
+
                 model_out = model(images, texts)
                 logit_scale = None
                 if isinstance(model_out, dict):
@@ -1313,12 +1537,6 @@ def train_one_epoch(
                         logit_scale = model_out["logit_scale"]
                 else:
                     model_out = {"input": model_out}
-                if args.distill:
-                    with torch.no_grad():
-                        dist_model_out = dist_model(images, texts)
-                    model_out.update(
-                        {f"dist_{k}": v for k, v in dist_model_out.items()}
-                    )
                 losses = loss(**model_out, target=targets)
 
                 if isinstance(losses, dict):
@@ -1478,63 +1696,94 @@ def train_one_epoch(
     # end for
 
 
+def create_log_path(args, model, latest=False):
+    # sanitize model name for filesystem / uri use, easier if we don't use / in name as a rule?
+    model_name_safe = model.replace("/", "-")
+    date_str = datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
+    if not latest:
+        if args.distributed:
+            # sync date_str from master to all ranks
+            date_str = broadcast_object(args, date_str)
+        return "-".join(
+            [
+                date_str,
+                f"model_{model_name_safe}",
+                f"lr_{args.lr}",
+                f"b_{args.batch_size}",
+                f"j_{args.workers}",
+                f"p_{args.precision}",
+            ]
+        )
+    else:
+        logs = []
+        for f in os.listdir(args.logs):
+            if f"model_{model_name_safe}" in f and os.path.exists(
+                os.path.join(args.logs, f, "checkpoints", "stage_1_latest.pt")
+            ):
+                logs.append(f)
+
+        # sort by date, then take the latest
+        logs = sorted(logs, key=lambda x: x.split("-")[0])
+        if logs:
+            return logs[-1]
+        else:
+            raise ValueError(f"No logs found for model: {model_name_safe}")
+
+
 def train(args):
     device = init_device(args)
     args.lr *= args.world_size
-    data, model_stage_1, tokenizer, targets = get_data_model(args)
-    model_stage_1.to(device)
 
-    def setup_train(args):
+    def setup_paths(args):
         # get the name of the experiments
-        if args.name is None:
-            # sanitize model name for filesystem / uri use, easier if we don't use / in name as a rule?
-            model_name_safe = args.model.replace("/", "-")
-            date_str = datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
-            if args.distributed:
-                # sync date_str from master to all ranks
-                date_str = broadcast_object(args, date_str)
-            args.name = "-".join(
-                [
-                    date_str,
-                    f"model_{model_name_safe}",
-                    f"lr_{args.lr}",
-                    f"b_{args.batch_size}",
-                    f"j_{args.workers}",
-                    f"p_{args.precision}",
-                ]
+        if args.stage == 1:
+            args.model = (
+                args.model_stage_1
+                if isinstance(args.model_stage_1, str)
+                else args.model_stage_1.__name__
             )
-
-        args._resume_latest = args.resume == "latest"
-        log_base_path = os.path.join(args.logs, args.name)
+        elif args.stage == 2:
+            args.model = (
+                args.model_stage_2
+                if isinstance(args.model_stage_2, str)
+                else args.model_stage_2.__name__
+            )
+        if args.name is None:
+            args.name = create_log_path(args, args.model)
+        resume_latest = args.resume == "latest"
+        args.log_base_path = os.path.join(args.logs, args.name)
         args.log_path = None
         if is_master(args, local=args.log_local):
-            os.makedirs(log_base_path, exist_ok=True)
+            os.makedirs(args.log_base_path, exist_ok=True)
             log_filename = f"out-{args.rank}" if args.log_local else "out.log"
-            args.log_path = os.path.join(log_base_path, log_filename)
-            if os.path.exists(args.log_path) and not args._resume_latest:
+            args.log_path = os.path.join(args.log_base_path, log_filename)
+            if os.path.exists(args.log_path) and not resume_latest:
                 print(
                     "Error. Experiment already exists. Use --name {} to specify a new experiment."
                 )
                 return -1
 
+    def setup_train(args, checkpoint_prefix=""):
         # Setup text logger
         args.log_level = logging.DEBUG if args.debug else logging.INFO
-        setup_logging(args.log_path, args.log_level)
-
+        setup_logging(None, args.log_level)
         # Setup wandb, tensorboard, checkpoint logging
         args.wandb = "wandb" in args.report_to or "all" in args.report_to
         args.tensorboard = "tensorboard" in args.report_to or "all" in args.report_to
-        args.checkpoint_path = os.path.join(log_base_path, "checkpoints")
+        args.checkpoint_path = os.path.join(args.log_base_path, "checkpoints")
         if is_master(args):
             args.tensorboard_path = (
-                os.path.join(log_base_path, "tensorboard") if args.tensorboard else ""
+                os.path.join(args.log_base_path, "tensorboard")
+                if args.tensorboard
+                else ""
             )
             for dirname in [args.tensorboard_path, args.checkpoint_path]:
                 if dirname:
                     os.makedirs(dirname, exist_ok=True)
         else:
             args.tensorboard_path = ""
-        if args._resume_latest:
+        resume_latest = args.resume == "latest"
+        if resume_latest:
             resume_from = None
             checkpoint_path = args.checkpoint_path
             # If using remote_sync, need to check the remote instead of the local checkpoints folder.
@@ -1558,7 +1807,9 @@ def train(args):
                 # stress, however it's very difficult to fully work around such situations.
                 if args.save_most_recent:
                     # if --save-most-recent flag is set, look for latest at a fixed filename
-                    resume_from = os.path.join(checkpoint_path, LATEST_CHECKPOINT_NAME)
+                    resume_from = os.path.join(
+                        checkpoint_path, f"{checkpoint_prefix}{LATEST_CHECKPOINT_NAME}"
+                    )
                     if not os.path.exists(resume_from):
                         # If no latest checkpoint has been saved yet, don't try to resume
                         resume_from = None
@@ -1620,19 +1871,8 @@ def train(args):
             )
         else:
             logging.info(f"Running with a single process. Device {args.device}.")
-        return args
 
     def prepare_params(model, data, args):
-        dist_model = None
-        args.distill = (
-            args.distill_model is not None and args.distill_pretrained is not None
-        )
-        if args.distill:
-            # FIXME: support distillation with grad accum.
-            assert args.accum_freq == 1
-            # FIXME: support distillation with coca.
-            assert "coca" not in args.model.lower()
-
         if (
             isinstance(args.force_image_size, (tuple, list))
             and len(args.force_image_size) == 1
@@ -1645,15 +1885,6 @@ def train(args):
             model_kwargs["init_logit_scale"] = np.log(10)  # different from CLIP
             model_kwargs["init_logit_bias"] = -10
 
-        if args.distill:
-            # FIXME: currently assumes the model you're distilling from has the same tokenizer & transforms.
-            dist_model, _, _ = create_model_and_transforms(
-                args.distill_model,
-                args.distill_pretrained,
-                device=device,
-                precision=args.precision,
-                output_dict=True,
-            )
         if args.use_bnb_linear is not None:
             print(
                 "=> using a layer from bitsandbytes.\n"
@@ -1709,16 +1940,11 @@ def train(args):
                 model, device_ids=[device], static_graph=args.ddp_static_graph
             )
 
-            if args.distill:
-                dist_model = torch.nn.parallel.DistributedDataParallel(
-                    dist_model, device_ids=[device], static_graph=args.ddp_static_graph
-                )
-
         # create optimizer and scaler
-        optimizer_stage_1 = None
-        scaler_stage_1 = None
+        optimizer = None
+        scaler = None
 
-        if "train" in data or args.dataset_type == "synthetic":
+        if "train" in data:
             assert not args.trace, "Cannot train with traced model"
 
             def exclude(n, p):
@@ -1741,7 +1967,7 @@ def train(args):
                 p for n, p in named_parameters if include(n, p) and p.requires_grad
             ]
 
-            optimizer_stage_1 = optim.AdamW(
+            optimizer = optim.AdamW(
                 [
                     {"params": gain_or_bias_params, "weight_decay": 0.0},
                     {"params": rest_params, "weight_decay": args.wd},
@@ -1750,52 +1976,29 @@ def train(args):
                 betas=(args.beta1, args.beta2),
                 eps=args.eps,
             )
-            scaler_stage_1 = GradScaler() if args.precision == "amp" else None
+            scaler = GradScaler() if args.precision == "amp" else None
 
         # optionally resume from a checkpoint
         start_epoch = 0
         if args.resume is not None:
             checkpoint = pt_load(args.resume, map_location="cpu")
-            if "epoch" in checkpoint:
-                # resuming a train checkpoint w/ epoch and optimizer state
-                start_epoch = checkpoint["epoch"]
-                sd = checkpoint["state_dict"]
-                if not args.distributed and next(iter(sd.items()))[0].startswith(
-                    "module"
-                ):
-                    sd = {k[len("module.") :]: v for k, v in sd.items()}
-                model.load_state_dict(sd)
-                if optimizer_stage_1 is not None:
-                    optimizer_stage_1.load_state_dict(checkpoint["optimizer"])
-                if scaler_stage_1 is not None and "scaler" in checkpoint:
-                    scaler_stage_1.load_state_dict(checkpoint["scaler"])
-                logging.info(
-                    f"=> resuming checkpoint '{args.resume}' (epoch {start_epoch})"
-                )
-            else:
-                # loading a bare (model only) checkpoint for fine-tune or evaluation
-                model.load_state_dict(checkpoint)
-                logging.info(
-                    f"=> loaded checkpoint '{args.resume}' (epoch {start_epoch})"
-                )
+            model, optimizer, scaler, start_epoch = load_checkpoint(
+                args, checkpoint, model, optimizer, scaler
+            )
 
         # initialize datasets
         assert len(data), "At least one train or eval dataset must be specified."
 
         # create scheduler if train
-        scheduler_stage_1 = None
-        if "train" in data and optimizer_stage_1 is not None:
+        scheduler = None
+        if "train" in data and optimizer is not None:
             total_steps = (
                 data["train"].dataloader.num_batches // args.accum_freq
             ) * args.epochs
             if args.lr_scheduler == "cosine":
-                scheduler_stage_1 = cosine_lr(
-                    optimizer_stage_1, args.lr, args.warmup, total_steps
-                )
+                scheduler = cosine_lr(optimizer, args.lr, args.warmup, total_steps)
             elif args.lr_scheduler == "const":
-                scheduler_stage_1 = const_lr(
-                    optimizer_stage_1, args.lr, args.warmup, total_steps
-                )
+                scheduler = const_lr(optimizer, args.lr, args.warmup, total_steps)
             elif args.lr_scheduler == "const-cooldown":
                 assert (
                     args.epochs_cooldown is not None
@@ -1803,8 +2006,8 @@ def train(args):
                 cooldown_steps = (
                     data["train"].dataloader.num_batches // args.accum_freq
                 ) * args.epochs_cooldown
-                scheduler_stage_1 = const_lr_cooldown(
-                    optimizer_stage_1,
+                scheduler = const_lr_cooldown(
+                    optimizer,
                     args.lr,
                     args.warmup,
                     total_steps,
@@ -1825,7 +2028,7 @@ def train(args):
             assert tensorboard is not None, "Please install tensorboard."
             writer = tensorboard.SummaryWriter(args.tensorboard_path)
 
-        if args.wandb and is_master(args):
+        if args.wandb and is_master(args) and args.epochs > 0:
             assert wandb is not None, "Please install wandb."
             logging.debug("Starting wandb.")
             args.train_sz = data["train"].dataloader.num_samples
@@ -1854,43 +2057,26 @@ def train(args):
             logging.info("Compiling model...")
             model = torch.compile(original_model)
 
-        if "train" not in data:
-            # If using int8, convert to inference mode.
-            if args.use_bnb_linear is not None:
-                from open_clip.utils import convert_int8_model_to_inference_mode
-
-                convert_int8_model_to_inference_mode(model)
-            # Evaluate.
-            evaluate(
-                model,
-                data,
-                start_epoch,
-                args,
-                tb_writer=writer,
-                tokenizer=tokenizer,
-            )
             return None
 
-        return (
-            original_model,
-            model,
-            optimizer_stage_1,
-            scaler_stage_1,
-            scheduler_stage_1,
-            dist_model,
-            writer,
-            start_epoch,
-            args,
-        )
+        return {
+            "original_model": original_model,
+            "model": model,
+            "optimizer": optimizer,
+            "scaler": scaler,
+            "scheduler": scheduler,
+            "writer": writer,
+            "start_epoch": start_epoch,
+        }, args
 
     def train_loop(
+        data,
         loss,
         original_model,
         model,
         optimizer,
         scaler,
         scheduler,
-        dist_model,
         writer,
         start_epoch,
         args,
@@ -1900,6 +2086,27 @@ def train(args):
             if is_master(args):
                 logging.info(f"Start epoch {epoch}")
 
+            if args.sampling is not None:
+                num_samples = data["train"].dataloader.num_samples
+                data["train"].dataloader, data["train"].sampler = modify_loader(
+                    loader=data["train"].dataloader,
+                    mode=args.sampling,
+                    ep=epoch,
+                    n_eps=args.epochs,
+                    distributed=args.distributed,
+                )
+                data["train"].dataloader.num_samples = num_samples
+                data["train"].dataloader.num_batches = len(data["train"].dataloader)
+            elif args.balanced_mixup and not isinstance(
+                data["train"].dataloader, ComboLoader
+            ):
+                num_samples = data["train"].dataloader.num_samples
+                data["train"].dataloader = get_combo_loader(
+                    data["train"].dataloader, distributed=args.distributed
+                )
+                data["train"].dataloader.num_samples = num_samples
+                data["train"].dataloader.num_batches = len(data["train"].dataloader)
+
             train_one_epoch(
                 model,
                 data,
@@ -1908,7 +2115,6 @@ def train(args):
                 optimizer,
                 scaler,
                 scheduler,
-                dist_model,
                 args,
                 tb_writer=writer,
             )
@@ -1964,12 +2170,17 @@ def train(args):
                     os.replace(tmp_save_path, latest_save_path)
         if args.wandb and is_master(args):
             wandb.finish()
-        return model
 
-    args = setup_train(args)
-    params = prepare_params(model_stage_1, data, args)
-    if params is not None:
-        loss_stage_1 = ClipLoss(
+    if args.stage == 1:
+        model_stage_1, preprocess_train, preprocess_val, tokenizer = init_model(
+            args.model_stage_1
+        )
+        data = get_data(args, preprocess_train, preprocess_val, tokenizer)
+        model_stage_1.to(device)
+        setup_paths(args)
+        setup_train(args, checkpoint_prefix=f"stage_{args.stage}_")
+        params, args = prepare_params(model_stage_1, data, args)
+        loss = ClipLoss(
             local_loss=args.local_loss,
             gather_with_grad=args.gather_with_grad,
             cache_labels=True,
@@ -1977,25 +2188,79 @@ def train(args):
             world_size=args.world_size,
         )
 
-        model_stage_1 = train_loop(
-            loss_stage_1,
-            *params,
-            "stage_1_",
-        )
-        if args.num_classes:
-            model_stage_2 = ClipClassifier(
+        resume_latest = args.resume == "latest"
+        if "train" not in data:
+            # If using int8, convert to inference mode.
+            if args.use_bnb_linear is not None:
+                from open_clip.utils import convert_int8_model_to_inference_mode
+
+                convert_int8_model_to_inference_mode(model_stage_1)
+            # Evaluate.
+            evaluate(
                 model_stage_1,
-                num_classes=args.num_classes,
+                data,
+                params["start_epoch"],
+                args,
+                tb_writer=params["writer"],
+                tokenizer=tokenizer,
             )
-            model_stage_2.to(device)
-            params = prepare_params(model_stage_2, data, args)
-            loss_stage_2 = F.cross_entropy
-            args.epochs = 50
-            model_stage_2 = train_loop(
-                loss_stage_2,
-                *params,
-                "stage_2_",
+        elif resume_latest and args.epochs == 0:
+            logging.info("Resuming latest checkpoint, skipping training.")
+            model_stage_1 = params[1]
+        else:
+            train_loop(
+                data,
+                loss,
+                **params,
+                args=args,
+                save_prefix=f"stage_{args.stage}_",
             )
+    elif args.stage == 2:
+        model_stage_1, preprocess_train, preprocess_val, tokenizer = init_model(
+            args.model_stage_1
+        )
+        data = get_data(args, preprocess_train, preprocess_val, tokenizer)
+        if not args.use_original_model:
+            # get the latest checkpoint from stage 1
+            base_path = create_log_path(args, args.model_stage_1, latest=True)
+            checkpoint_path = os.path.join(
+                args.logs, base_path, "checkpoints", f"stage_1_{LATEST_CHECKPOINT_NAME}"
+            )
+            out = load_checkpoint(
+                args, pt_load(checkpoint_path, map_location="cpu"), model_stage_1
+            )
+            model_stage_1 = out[0]
+        model_stage_2 = ClipClassifier(
+            model_stage_1,
+            feature_dim=1024
+            if not (args.use_visual_only or args.use_text_only or args.use_inner_prod)
+            else 512,
+            num_classes=args.num_classes,
+            use_visual_only=args.use_visual_only,
+            use_text_only=args.use_text_only,
+            use_inner_prod=args.use_inner_prod,
+        )
+        model_stage_2.to(device)
+        setup_paths(args)
+        setup_train(args, checkpoint_prefix=f"stage_{args.stage}_")
+        params, args = prepare_params(model_stage_2, data, args)
+        if not isinstance(args.class_loss_weight, bool):
+            if not torch.is_tensor(args.class_loss_weight):
+                args.class_loss_weight = torch.tensor(
+                    args.class_loss_weight, dtype=torch.float32
+                ).to(device)
+            loss_stage_2 = partial(cross_entropy_loss, weight=args.class_loss_weight)
+        else:
+            loss_stage_2 = cross_entropy_loss
+        model_stage_2 = train_loop(
+            data,
+            loss_stage_2,
+            **params,
+            args=args,
+            save_prefix="stage_2_",
+        )
+    if args.distributed:
+        dist.destroy_process_group()
 
 
 def copy_codebase(args):
@@ -2074,10 +2339,7 @@ def train_test_split(data, test_size=0.2, random_state=None, stratify=None):
     return train_data, test_data
 
 
-def get_data_model(args):
-    clip_model, preprocess_train, preprocess_val, tokenizer = init_model()
-    model = ClipModel(clip_model)
-
+def get_data(args, preprocess_train, preprocess_val, tokenizer):
     if is_master(args):
         logging.info("Loading data...")
     # Create dataset
@@ -2090,48 +2352,21 @@ def get_data_model(args):
         metadata_or_path=test_metadata_path,
         tokenizer=tokenizer,
         transform=preprocess_val,
-        # is_train=False,
-        is_train=True,
+        is_train=False,
     )
     num_test_samples = len(test_dataset)
 
-    # test_sampler = BalancedSampler(test_dataset)
     test_data_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
-        # sampler=test_sampler,
         pin_memory=True,
         num_workers=args.workers,
         drop_last=False,
-        # drop_last=True,
     )
-    # test_data_loader.num_samples = len(test_sampler)
     test_data_loader.num_samples = num_test_samples
     test_data_loader.num_batches = len(test_data_loader)
 
     test_data = DataInfo(test_data_loader)
-    # test_data.sampler = test_sampler
-
-    # fake_test_dataset = IsicChallengeDataset(
-    #     data_path=test_dataset_path,
-    #     metadata_or_path=test_metadata_path,
-    #     tokenizer=tokenizer,
-    #     transform=preprocess_val,
-    #     # is_train=False,
-    #     is_train=False,
-    # )
-    # fake_val_data_loader = DataLoader(
-    #     fake_test_dataset,
-    #     batch_size=args.batch_size,
-    #     shuffle=True,
-    #     pin_memory=True,
-    #     num_workers=args.workers,
-    #     drop_last=False,
-    # )
-    # fake_val_data_loader.num_samples = num_test_samples
-    # fake_val_data_loader.num_batches = len(fake_val_data_loader)
-    #
-    # fake_val_data = DataInfo(fake_val_data_loader)
 
     train_dataset_path = args.data_path + "train-image/image"
     train_metadata_path = args.data_path + "train-metadata.csv"
@@ -2142,8 +2377,12 @@ def get_data_model(args):
         logging.info(f"Loding train dataset from {train_dataset_path}")
         logging.info(f"Stratifying by target: {targets.value_counts()}")
     train_metadata, val_metadata = train_test_split(
-        train_metadata, test_size=0.2, stratify=targets
+        train_metadata, test_size=0.2, stratify=targets, random_state=args.seed
     )
+    if isinstance(args.class_loss_weight, bool) and args.class_loss_weight:
+        args.class_loss_weight = compute_class_weight(
+            "balanced", classes=np.unique(targets), y=targets
+        )
 
     train_dataset = IsicChallengeDataset(
         data_path=train_dataset_path,
@@ -2151,7 +2390,7 @@ def get_data_model(args):
         tokenizer=tokenizer,
         transform=preprocess_train,
         is_train=True,
-        # small_test=True,
+        small_test=args.small_test,
     )
 
     val_dataset = IsicChallengeDataset(
@@ -2160,13 +2399,15 @@ def get_data_model(args):
         tokenizer=tokenizer,
         transform=preprocess_val,
         is_train=False,
-        # small_test=True,
+        small_test=args.small_test,
     )
 
     num_train_samples = len(train_dataset)
     num_val_samples = len(val_dataset)
 
-    train_sampler = DistributedSampler(train_dataset) if args.distributed else None
+    train_sampler = None
+    if args.distributed:
+        train_sampler = DistributedSampler(train_dataset)
     shuffle = not args.distributed
     train_data_loader = DataLoader(
         train_dataset,
@@ -2180,7 +2421,7 @@ def get_data_model(args):
     train_data_loader.num_samples = num_train_samples
     train_data_loader.num_batches = len(train_data_loader)
 
-    train_data = DataInfo(train_data_loader, sampler=train_sampler)
+    train_data = DataInfo(train_data_loader)
 
     num_val_samples = len(val_dataset)
 
@@ -2198,31 +2439,407 @@ def get_data_model(args):
     val_data = DataInfo(val_data_loader)
 
     data = {"train": train_data, "val": val_data}
-    return data, model, tokenizer, train_dataset.targets
+    return data
+
+
+@dataclass
+class Args:
+    data_path: str
+    val_data_path: Optional[str] = None
+    train_num_samples: Optional[int] = None
+    val_num_samples: Optional[int] = None
+    num_classes: int = None
+    sampling: Optional[str] = None
+    balanced_mixup: bool = False
+    device: str = "auto"
+    logs: str = "./logs/"
+    log_local: bool = False
+    name: Optional[str] = None
+    workers: int = 4
+    batch_size: int = 64
+    epochs: int = 3
+    epochs_cooldown: Optional[int] = None
+    lr: Optional[float] = 1e-4
+    beta1: Optional[float] = None
+    beta2: Optional[float] = None
+    eps: Optional[float] = None
+    wd: float = 0.2
+    warmup: int = 10000
+    use_bn_sync: bool = False
+    skip_scheduler: bool = False
+    lr_scheduler: str = "cosine"
+    lr_cooldown_end: float = 0.0
+    lr_cooldown_power: float = 1.0
+    save_frequency: int = 1
+    save_most_recent: bool = False
+    val_frequency: int = 1
+    resume: Optional[str] = None
+    precision: str = "amp"
+    stage: int = 1
+    model_stage_1: Union[Type, str] = (
+        "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+    )
+    model_stage_2: Union[Type, str] = ClipClassifier
+    use_inner_prod: bool = False
+    use_visual_only: bool = False
+    use_text_only: bool = False
+    use_original_model: bool = False
+    tokenizer: Optional[Union[Type, str]] = None
+    lock_image: bool = False
+    lock_image_unlocked_groups: int = 0
+    lock_image_freeze_bn_stats: bool = False
+    image_mean: Optional[List[float]] = None
+    image_std: Optional[List[float]] = None
+    image_interpolation: Optional[str] = None
+    image_resize_mode: Optional[str] = None
+    aug_cfg: Optional[List[str]] = field(default_factory=list)
+    grad_checkpointing: bool = False
+    local_loss: bool = False
+    gather_with_grad: bool = False
+    force_image_size: Optional[List[int]] = None
+    force_quick_gelu: bool = False
+    force_patch_dropout: Optional[float] = None
+    force_custom_text: bool = False
+    torchscript: bool = False
+    torchcompile: bool = False
+    trace: bool = False
+    accum_freq: int = 1
+    dist_url: str = "env://"
+    dist_backend: str = "nccl"
+    report_to: str = ""
+    wandb_notes: str = ""
+    wandb_project_name: str = "open-clip"
+    debug: bool = False
+    copy_codebase: bool = False
+    ddp_static_graph: bool = False
+    no_set_device_rank: bool = False
+    seed: int = 42
+    grad_clip_norm: Optional[float] = None
+    lock_text: bool = False
+    lock_text_unlocked_layers: int = 0
+    lock_text_freeze_layer_norm: bool = True
+    log_every_n_steps: int = 100
+    class_loss_weight: bool = False
+    coca_caption_loss_weight: float = 2.0
+    coca_contrastive_loss_weight: float = 1.0
+    distributed: bool = False
+    remote_sync: Optional[str] = None
+    remote_sync_frequency: int = 300
+    remote_sync_protocol: str = "fsspec"
+    delete_previous_checkpoint: bool = False
+    use_bnb_linear: Optional[str] = None
+    siglip: bool = False
+    small_test: bool = False
+
+
+def arg_parser() -> Args:
+    parser = argparse.ArgumentParser(description="Argument parser for training script")
+
+    parser.add_argument(
+        "--data-path",
+        type=str,
+        default="data/isic-2024-challenge/",
+        help="Path to the dataset",
+    )
+    parser.add_argument(
+        "--val-data-path", type=str, help="Path to the validation dataset"
+    )
+    parser.add_argument(
+        "--train-num-samples", type=int, help="Number of training samples"
+    )
+    parser.add_argument(
+        "--val-num-samples", type=int, help="Number of validation samples"
+    )
+    parser.add_argument(
+        "--num-classes",
+        type=int,
+        default=2,
+        help="Number of classes for classification (Stage 2 only)",
+    )
+    parser.add_argument("--sampling", type=str, help="Sampling method")
+    parser.add_argument("--balanced-mixup", type=float, help="Learning rate")
+    parser.add_argument(
+        "--device", type=str, default="auto", help="Device to use for training"
+    )
+    parser.add_argument(
+        "--logs", type=str, default="./logs/", help="Directory to save logs"
+    )
+    parser.add_argument("--log-local", action="store_true", help="Log local ranks")
+    parser.add_argument("--name", type=str, help="Name of the experiment")
+    parser.add_argument(
+        "--workers", type=int, default=4, help="Number of data loading workers"
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=64, help="Batch size for training"
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=1, help="Number of epochs to train"
+    )
+    parser.add_argument("--epochs-cooldown", type=int, help="Number of cooldown epochs")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument(
+        "--beta1", type=float, default=0.9, help="Beta1 for Adam optimizer"
+    )
+    parser.add_argument(
+        "--beta2", type=float, default=0.999, help="Beta2 for Adam optimizer"
+    )
+    parser.add_argument(
+        "--eps", type=float, default=1e-8, help="Epsilon for Adam optimizer"
+    )
+    parser.add_argument("--wd", type=float, default=0.05, help="Weight decay")
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=10000,
+        help="Warmup steps for learning rate scheduler",
+    )
+    parser.add_argument(
+        "--use-bn-sync",
+        action="store_true",
+        help="Use synchronized batch normalization",
+    )
+    parser.add_argument(
+        "--skip-scheduler", action="store_true", help="Skip learning rate scheduler"
+    )
+    parser.add_argument(
+        "--lr-scheduler",
+        type=str,
+        default="cosine",
+        help="Learning rate scheduler type",
+    )
+    parser.add_argument(
+        "--lr-cooldown-end",
+        type=float,
+        default=0.0,
+        help="Learning rate at the end of cooldown",
+    )
+    parser.add_argument(
+        "--lr-cooldown-power",
+        type=float,
+        default=1.0,
+        help="Power for learning rate cooldown",
+    )
+    parser.add_argument(
+        "--save-frequency", type=int, default=1, help="Frequency of saving checkpoints"
+    )
+    parser.add_argument(
+        "--save-most-recent",
+        action="store_true",
+        help="Save the most recent checkpoint",
+    )
+    parser.add_argument(
+        "--val-frequency", type=int, default=1, help="Frequency of validation"
+    )
+    parser.add_argument("--resume", type=str, help="Path to resume checkpoint")
+    parser.add_argument(
+        "--precision", type=str, default="amp", help="Precision for training"
+    )
+    parser.add_argument("--stage", type=int, default=1, help="Training stage")
+    parser.add_argument(
+        "--model-stage-1",
+        type=str,
+        default="microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224",
+        help="Model for stage 1",
+    )
+    parser.add_argument(
+        "--model-stage-2", type=str, default="ClipClassifier", help="Model for stage 2"
+    )
+    parser.add_argument(
+        "--use-inner-prod",
+        action="store_true",
+        help=(
+            "Whether to use inner product for stage 2 "
+            "or the default linear layer for classification"
+        ),
+    )
+    parser.add_argument(
+        "--use-visual-only",
+        action="store_true",
+        help=(
+            "Whether to use only the visual features for stage 2 "
+            "or both visual and text features"
+        ),
+    )
+    parser.add_argument(
+        "--use-text-only",
+        action="store_true",
+        help=(
+            "Whether to use only the text features for stage 2 "
+            "or both visual and text features"
+        ),
+    )
+    parser.add_argument(
+        "--use-original-model",
+        action="store_true",
+        help=(
+            "Whether to use the fine-tuned model "
+            "or the original pretrained model for stage 2",
+        ),
+    )
+    parser.add_argument("--tokenizer", type=str, help="Tokenizer to use")
+    parser.add_argument(
+        "--lock-image", action="store_true", help="Lock the image tower of the model"
+    )
+    parser.add_argument(
+        "--lock-image-unlocked-groups",
+        type=int,
+        default=0,
+        help="Number of unlocked groups in the image tower",
+    )
+    parser.add_argument(
+        "--lock-image-freeze-bn-stats",
+        action="store_true",
+        help="Freeze batch normalization statistics in the image tower",
+    )
+    parser.add_argument(
+        "--image-mean",
+        type=float,
+        nargs="+",
+        help="Mean values for image normalization",
+    )
+    parser.add_argument(
+        "--image-std",
+        type=float,
+        nargs="+",
+        help="Standard deviation values for image normalization",
+    )
+    parser.add_argument(
+        "--image-interpolation",
+        type=str,
+        help="Interpolation method for image resizing",
+    )
+    parser.add_argument("--image-resize-mode", type=str, help="Resize mode for images")
+    parser.add_argument(
+        "--aug-cfg", type=str, nargs="+", help="Augmentation configuration"
+    )
+    parser.add_argument(
+        "--grad-checkpointing",
+        action="store_true",
+        help="Enable gradient checkpointing",
+    )
+    parser.add_argument(
+        "--local-loss",
+        action="store_true",
+        help="Use local loss for distributed training",
+    )
+    parser.add_argument(
+        "--gather-with-grad", action="store_true", help="Gather gradients with features"
+    )
+    parser.add_argument(
+        "--force-image-size", type=int, nargs="+", help="Force image size"
+    )
+    parser.add_argument(
+        "--force-quick-gelu", action="store_true", help="Force Quick GELU activation"
+    )
+    parser.add_argument(
+        "--force-patch-dropout", type=float, help="Force patch dropout rate"
+    )
+    parser.add_argument(
+        "--force-custom-text", action="store_true", help="Force custom text model"
+    )
+    parser.add_argument("--torchscript", action="store_true", help="Use TorchScript")
+    parser.add_argument("--torchcompile", action="store_true", help="Use Torch compile")
+    parser.add_argument("--trace", action="store_true", help="Enable tracing")
+    parser.add_argument(
+        "--accum-freq", type=int, default=1, help="Frequency of gradient accumulation"
+    )
+    parser.add_argument(
+        "--dist-url",
+        type=str,
+        default="env://",
+        help="URL for distributed training setup",
+    )
+    parser.add_argument(
+        "--dist-backend",
+        type=str,
+        default="nccl",
+        help="Backend for distributed training",
+    )
+    parser.add_argument("--report-to", type=str, default="", help="Reporting tool")
+    parser.add_argument("--wandb-notes", type=str, help="WandB notes")
+    parser.add_argument(
+        "--wandb-project-name", type=str, default="open-clip", help="WandB project name"
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debugging mode")
+    parser.add_argument(
+        "--copy-codebase", action="store_true", help="Copy codebase for reproducibility"
+    )
+    parser.add_argument(
+        "--ddp-static-graph", action="store_true", help="Enable DDP static graph"
+    )
+    parser.add_argument(
+        "--no-set-device-rank", action="store_true", help="Do not set device rank"
+    )
+    parser.add_argument("--seed", type=int, default=0, help="Random seed")
+    parser.add_argument("--grad-clip-norm", type=float, help="Gradient clipping norm")
+    parser.add_argument(
+        "--lock-text", action="store_true", help="Lock the text tower of the model"
+    )
+    parser.add_argument(
+        "--lock-text-unlocked-layers",
+        type=int,
+        default=0,
+        help="Number of unlocked layers in the text tower",
+    )
+    parser.add_argument(
+        "--lock-text-freeze-layer-norm",
+        action="store_true",
+        help="Freeze layer normalization in the text tower",
+    )
+    parser.add_argument(
+        "--log-every-n-steps", type=int, default=100, help="Logging frequency"
+    )
+    parser.add_argument(
+        "--class-loss-weight",
+        action="store_true",
+        help="Use class loss weight for stage 2",
+    )
+    parser.add_argument(
+        "--coca-caption-loss-weight",
+        type=float,
+        default=2.0,
+        help="Weight for COCA caption loss",
+    )
+    parser.add_argument(
+        "--coca-contrastive-loss-weight",
+        type=float,
+        default=1.0,
+        help="Weight for COCA contrastive loss",
+    )
+    parser.add_argument(
+        "--distributed", action="store_true", help="Enable distributed training"
+    )
+    parser.add_argument("--remote-sync", type=str, help="Remote sync path")
+    parser.add_argument(
+        "--remote-sync-frequency",
+        type=int,
+        default=300,
+        help="Remote sync frequency in seconds",
+    )
+    parser.add_argument(
+        "--remote-sync-protocol",
+        type=str,
+        default="fsspec",
+        help="Remote sync protocol",
+    )
+    parser.add_argument(
+        "--delete-previous-checkpoint",
+        action="store_true",
+        help="Delete previous checkpoints",
+    )
+    parser.add_argument("--use-bnb-linear", type=str, help="Use BnB linear layer")
+    parser.add_argument("--siglip", action="store_true", help="Use SigLIP model")
+    parser.add_argument(
+        "--small-test", action="store_true", help="Use small dataset for debugging"
+    )
+
+    args = parser.parse_args()
+    return Args(**vars(args))
 
 
 # %%
 if __name__ == "__main__":
-    args = Args(
-        num_classes=2,
-        lr=1e-6,
-        eps=1e-8,
-        beta1=0.9,
-        beta2=0.999,
-        wd=0.05,
-        epochs=3,
-        report_to="wandb",
-        batch_size=128,
-        # device="cpu",
-        save_most_recent=True,
-        workers=4,
-        data_path="data/isic-2024-challenge/",
-        lock_image=True,
-        lock_image_unlocked_groups=1,
-        lock_text=True,
-        lock_text_unlocked_layers=1,
-    )
-
+    args = arg_parser()
     # pre-training
     train(args)
     # %%
