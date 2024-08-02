@@ -44,6 +44,15 @@ def all_gather(
     return all_image_features, all_text_features
 
 
+def cross_entropy_loss(
+    input: torch.Tensor, target: torch.Tensor, weight=None
+) -> torch.Tensor:
+    target_is_float = target.dtype in (torch.float, torch.double)
+    if target_is_float:
+        return -(input.log_softmax(dim=-1) * target).sum(dim=-1).mean()
+    return F.cross_entropy(input, target, weight=weight)
+
+
 class ClipLoss(torch.nn.Module):
     def __init__(
         self,
@@ -52,7 +61,6 @@ class ClipLoss(torch.nn.Module):
         cache_labels=False,
         rank=0,
         world_size=1,
-        use_horovod=False,
     ):
         super().__init__()
         self.local_loss = local_loss
@@ -60,7 +68,6 @@ class ClipLoss(torch.nn.Module):
         self.cache_labels = cache_labels
         self.rank = rank
         self.world_size = world_size
-        self.use_horovod = use_horovod
 
         # cache state
         self.prev_num_logits = 0
@@ -105,12 +112,31 @@ class ClipLoss(torch.nn.Module):
 
         return logits_per_image, logits_per_text
 
-    def forward(self, image_features, text_features, logit_scale, output_dict=False):
+    def _gather_labels(self, labels):
+        if self.world_size > 1:
+            gathered_labels = [torch.zeros_like(labels) for _ in range(self.world_size)]
+            dist.all_gather(gathered_labels, labels)
+            if not self.local_loss:
+                gathered_labels[self.rank] = labels
+            return torch.cat(gathered_labels, dim=0)
+        return labels
+
+    def forward(
+        self,
+        image_features,
+        text_features,
+        logit_scale,
+        output_dict=True,
+        target=None,
+    ):
         device = image_features.device
         logits_per_image, logits_per_text = self.get_logits(
             image_features, text_features, logit_scale
         )
 
+        # if target is not None:
+        # labels = self._gather_labels(target)
+        # else:
         labels = self.get_ground_truth(device, logits_per_image.shape[0])
 
         total_loss = (

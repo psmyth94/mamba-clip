@@ -1,4 +1,3 @@
-import logging
 import math
 import os
 import time
@@ -16,6 +15,7 @@ from .utils import (
     is_master,
     random_seed,
     setup_logging,
+    logging,
 )
 
 try:
@@ -23,6 +23,7 @@ try:
 except ImportError:
     wandb = None
 
+logger = logging.get_logger(__name__)
 
 LATEST_CHECKPOINT_NAME = "latest.pt"
 
@@ -76,17 +77,15 @@ def train_one_epoch(
     optimizer,
     scaler,
     scheduler,
-    dist_model,
     args,
     tb_writer=None,
 ):
     device = torch.device(args.device)
     autocast = get_autocast(args.precision)
     input_dtype = get_input_dtype(args.precision)
+    model = model.to(device=device)
 
     model.train()
-    if args.distill:
-        dist_model.eval()
 
     data["train"].set_epoch(
         epoch
@@ -109,28 +108,58 @@ def train_one_epoch(
         if not args.skip_scheduler:
             scheduler(step)
 
-        images, texts = batch
+        if args.balanced_mixup:
+            images, texts, targets = batch[0][0], batch[0][1], batch[0][2]
+            balanced_images, balanced_texts, balanced_targets = (
+                batch[1][0],
+                batch[1][1],
+                batch[1][2],
+            )
+            balanced_images = balanced_images.to(device=device, dtype=input_dtype)
+            balanced_texts = balanced_texts.to(device=device)
+            balanced_targets = balanced_targets.to(device=device)
+        else:
+            images, texts, targets = batch
         images = images.to(device=device, dtype=input_dtype, non_blocking=True)
         texts = texts.to(device=device, non_blocking=True)
+        targets = targets.to(device=device, non_blocking=True)
 
         data_time_m.update(time.time() - end)
         optimizer.zero_grad()
 
         if args.accum_freq == 1:
             with autocast():
-                model_out = model(images, texts)
-                logit_scale = model_out["logit_scale"]
-                if args.distill:
-                    with torch.no_grad():
-                        dist_model_out = dist_model(images, texts)
-                    model_out.update(
-                        {f"dist_{k}": v for k, v in dist_model_out.items()}
+                if args.balanced_mixup:
+                    lam = np.random.beta(a=args.balanced_mixup, b=1)
+
+                    images = (1 - lam) * images + lam * balanced_images
+                    if lam > 0.5:
+                        texts = balanced_texts
+
+                    n_classes = args.num_classes
+                    targets = F.one_hot(targets, n_classes)
+                    targets = (1 - lam) * targets + lam * F.one_hot(
+                        balanced_targets, n_classes
                     )
-                losses = loss(**model_out, output_dict=True)
+                    del balanced_images
+                    del balanced_texts
+                    del balanced_targets
 
-                total_loss = sum(losses.values())
-                losses["loss"] = total_loss
+                model_out = model(images, texts)
+                logit_scale = None
+                if isinstance(model_out, dict):
+                    if "logit_scale" in model_out:
+                        logit_scale = model_out["logit_scale"]
+                else:
+                    model_out = {"input": model_out}
+                losses = loss(**model_out, target=targets)
 
+                if isinstance(losses, dict):
+                    total_loss = sum(losses.values())
+                    losses["loss"] = total_loss
+                else:
+                    total_loss = losses
+                    losses = {"loss": losses}
             backward(total_loss, scaler)
         else:
             # First, cache the features without any gradient tracking.
@@ -188,22 +217,12 @@ def train_one_epoch(
                 backward(total_loss, scaler)
 
         if scaler is not None:
-            if args.horovod:
-                optimizer.synchronize()
+            if args.grad_clip_norm is not None:
                 scaler.unscale_(optimizer)
-                if args.grad_clip_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), args.grad_clip_norm, norm_type=2.0
-                    )
-                with optimizer.skip_synchronize():
-                    scaler.step(optimizer)
-            else:
-                if args.grad_clip_norm is not None:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), args.grad_clip_norm, norm_type=2.0
-                    )
-                scaler.step(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), args.grad_clip_norm, norm_type=2.0
+                )
+            scaler.step(optimizer)
             scaler.update()
         else:
             if args.grad_clip_norm is not None:
@@ -217,8 +236,9 @@ def train_one_epoch(
             accum_images, accum_texts, accum_features = [], [], {}
 
         # Note: we clamp to 4.6052 = ln(100), as in the original paper.
-        with torch.no_grad():
-            unwrap_model(model).logit_scale.clamp_(0, math.log(100))
+        if hasattr(unwrap_model(model), "logit_scale"):
+            with torch.no_grad():
+                unwrap_model(model).logit_scale.clamp_(0, math.log(100))
 
         batch_time_m.update(time.time() - end)
         end = time.time()
@@ -238,26 +258,28 @@ def train_one_epoch(
                     losses_m[key] = AverageMeter()
                 losses_m[key].update(val.item(), batch_size)
 
-            logit_scale_scalar = logit_scale.item()
-            loss_log = " ".join(
-                [
-                    f"{loss_name.capitalize()}: {loss_m.val:#.5g} ({loss_m.avg:#.5g})"
-                    for loss_name, loss_m in losses_m.items()
-                ]
-            )
+            logit_scale_scalar = logit_scale.item() if logit_scale is not None else None
+            loss_log = " ".join([
+                f"{loss_name.capitalize()}: {loss_m.val:#.5g} ({loss_m.avg:#.5g})"
+                for loss_name, loss_m in losses_m.items()
+            ])
             samples_per_second = (
                 args.accum_freq * args.batch_size * args.world_size / batch_time_m.val
             )
             samples_per_second_per_gpu = (
                 args.accum_freq * args.batch_size / batch_time_m.val
             )
-            logging.info(
+            log_info = (
                 f"Train Epoch: {epoch} [{num_samples:>{sample_digits}}/{samples_per_epoch} ({percent_complete:.0f}%)] "
                 f"Data (t): {data_time_m.avg:.3f} "
                 f"Batch (t): {batch_time_m.avg:.3f}, {samples_per_second:#g}/s, {samples_per_second_per_gpu:#g}/s/gpu "
                 f"LR: {optimizer.param_groups[0]['lr']:5f} "
-                f"Logit Scale: {logit_scale_scalar:.3f} " + loss_log
             )
+            if logit_scale_scalar is not None:
+                log_info += f"Scale: {logit_scale_scalar:.3f} "
+            log_info += loss_log
+
+            logger.info(log_info)
 
             # Save train loss / etc. Using non avg meter values as loggers have their own smoothing
             log_data = {
@@ -307,16 +329,14 @@ def train(args, model, data, device, tokenizer):
         if args.distributed:
             # sync date_str from master to all ranks
             date_str = broadcast_object(args, date_str)
-        args.name = "-".join(
-            [
-                date_str,
-                f"model_{model_name_safe}",
-                f"lr_{args.lr}",
-                f"b_{args.batch_size}",
-                f"j_{args.workers}",
-                f"p_{args.precision}",
-            ]
-        )
+        args.name = "-".join([
+            date_str,
+            f"model_{model_name_safe}",
+            f"lr_{args.lr}",
+            f"b_{args.batch_size}",
+            f"j_{args.workers}",
+            f"p_{args.precision}",
+        ])
 
     resume_latest = args.resume == "latest"
     log_base_path = os.path.join(args.logs, args.name)

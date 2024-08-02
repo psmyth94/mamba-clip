@@ -1,0 +1,28 @@
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - cxx-compiler
+  - nccl
+  - pytorch-cuda=11.8
+  - pytorch
+  - torchvision
+  - cudatoolkit=11.8
+  - tqdm
+  - pandas
+  - pip
+  - pip:
+    - ftfy
+    - regex
+    - fsspec
+    - timm>=1.0.7
+    - huggingface_hub
+    - transformers[sentencepiece]
+    - braceexpand
+    - kaggle
+    - accelerate
+    - open_clip_torch
+

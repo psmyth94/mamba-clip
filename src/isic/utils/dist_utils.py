@@ -1,4 +1,6 @@
+# type: ignore
 import os
+from datetime import datetime, timedelta
 
 import torch
 import torch.distributed as dist
@@ -29,45 +31,58 @@ def world_info_from_env():
     return local_rank, global_rank, world_size
 
 
-def init_distributed_device(args):
+def init_device(args):
     # Distributed training = training on more than one GPU.
     # Works in both single and multi-node scenarios.
+    if torch.cuda.is_available() and (args.device == "auto" or "cuda" in args.device):
+        # This enables tf32 on Ampere GPUs which is only 8% slower than
+        # float16 and almost as accurate as float32
+        # This was a default in pytorch until 1.12
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
     args.distributed = False
     args.world_size = 1
     args.rank = 0  # global rank
     args.local_rank = 0
-    if is_using_distributed():
-        if "SLURM_PROCID" in os.environ:
-            # DDP via SLURM
-            args.local_rank, args.rank, args.world_size = world_info_from_env()
-            # SLURM var -> torch.distributed vars in case needed
-            os.environ["LOCAL_RANK"] = str(args.local_rank)
-            os.environ["RANK"] = str(args.rank)
-            os.environ["WORLD_SIZE"] = str(args.world_size)
-            torch.distributed.init_process_group(
-                backend=args.dist_backend,
-                init_method=args.dist_url,
-                world_size=args.world_size,
-                rank=args.rank,
-            )
-        else:
-            # DDP via torchrun, torch.distributed.launch
-            args.local_rank, _, _ = world_info_from_env()
-            torch.distributed.init_process_group(
-                backend=args.dist_backend, init_method=args.dist_url
-            )
-            args.world_size = torch.distributed.get_world_size()
-            args.rank = torch.distributed.get_rank()
-        args.distributed = True
+    device = args.device
+    if args.device == "auto" or "cuda" in args.device:
+        if is_using_distributed():
+            if "SLURM_PROCID" in os.environ:
+                # DDP via SLURM
+                args.local_rank, args.rank, args.world_size = world_info_from_env()
+                # SLURM var -> torch.distributed vars in case needed
+                os.environ["LOCAL_RANK"] = str(args.local_rank)
+                os.environ["RANK"] = str(args.rank)
+                os.environ["WORLD_SIZE"] = str(args.world_size)
+                torch.distributed.init_process_group(
+                    backend=args.dist_backend,
+                    init_method=args.dist_url,
+                    world_size=args.world_size,
+                    timeout=timedelta(0, 3600),
+                    rank=args.rank,
+                )
+            else:
+                # DDP via torchrun, torch.distributed.launch
+                args.local_rank, _, _ = world_info_from_env()
+                torch.distributed.init_process_group(
+                    backend=args.dist_backend,
+                    init_method=args.dist_url,
+                    timeout=datetime.timedelta(0, 3600),
+                    rank=args.rank,
+                )
+                args.world_size = torch.distributed.get_world_size()
+                args.rank = torch.distributed.get_rank()
+            args.distributed = True
 
-    if torch.cuda.is_available():
-        if args.distributed and not args.no_set_device_rank:
-            device = "cuda:%d" % args.local_rank
+        if torch.cuda.is_available():
+            if args.distributed and not args.no_set_device_rank:
+                device = "cuda:%d" % args.local_rank
+            else:
+                device = "cuda:0"
+            torch.cuda.set_device(device)
         else:
-            device = "cuda:0"
-        torch.cuda.set_device(device)
-    else:
-        device = "cpu"
+            device = "cpu"
     args.device = device
     device = torch.device(device)
     return device

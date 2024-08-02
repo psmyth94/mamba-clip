@@ -1,8 +1,0 @@
-transformers
-accelerate
-pytorch
-pytorch-cuda=11.8
-torchvision
-cudatoolkit=11.8
-open_clip_torch
-braceexpand

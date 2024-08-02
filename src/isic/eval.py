@@ -1,6 +1,5 @@
 # type: ignore
 import json
-import logging
 import os
 
 import numpy as np
@@ -8,7 +7,14 @@ import torch
 import torch.nn.functional as F
 from sklearn.metrics import auc, roc_curve
 
-from .utils import is_master, get_autocast, get_input_dtype
+from .utils import get_autocast, get_input_dtype, is_master, logging
+
+logger = logging.get_logger(__name__)
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 
 def partial_auc(y_true, y_pred, min_tpr=0.8):
@@ -58,76 +64,87 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
         # FIXME this does not scale past small eval datasets
         # all_image_features @ all_text_features will blow up memory and compute very quickly
         cumulative_loss = 0.0
-        cumulative_gen_loss = 0.0
-        all_image_features, all_neg_text_features, all_pos_text_features = [], [], []
-        all_logits = []
+        all_image_features, all_text_features = [], []
+        all_probs = []
+        all_zero_shot_probs = []
         all_targets = []
         with torch.inference_mode():
             for i, batch in enumerate(dataloader):
-                images, neg_texts, pos_texts, targets = batch
+                images, texts, targets = batch
                 images = images.to(device=device, dtype=input_dtype, non_blocking=True)
-                neg_texts = neg_texts.to(device=device, non_blocking=True)
-                pos_texts = pos_texts.to(device=device, non_blocking=True)
+                texts = texts.to(device=device, non_blocking=True)
                 targets = targets.to(device=device, non_blocking=True)
                 all_targets.append(targets.cpu())
 
                 with autocast():
-                    model_out = model(images, neg_texts, pos_texts)
-                    image_features = model_out["image_features"]
-                    neg_text_features = model_out["text_features"]
-                    pos_text_features = model_out["secondary_text_features"]
-                    logit_scale = model_out["logit_scale"]
-                    # features are accumulated in CPU tensors, otherwise GPU memory exhausted quickly
-                    # however, system RAM is easily exceeded and compute time becomes problematic
-                    all_image_features.append(image_features.cpu())
-                    all_neg_text_features.append(neg_text_features.cpu())
-                    all_pos_text_features.append(pos_text_features.cpu())
-                    logit_scale = logit_scale.mean()
-                    logits_per_neg_text = (
-                        logit_scale * image_features @ neg_text_features.t()
-                    ).t()
-                    logits_per_pos_text = (
-                        logit_scale * image_features @ pos_text_features.t()
-                    ).t()
-                    # concatenate logits for negative and positive texts
-                    logits = torch.cat(
-                        [logits_per_neg_text, logits_per_pos_text], dim=1
-                    )
-                    all_logits.append(logits.cpu())
-                    # convert to probabilities
-                    probs = F.softmax(logits, dim=1)
+                    model_out = model(images, texts)
+                    batch_size = images.shape[0]
+                    if (
+                        isinstance(model_out, dict)
+                        and "image_features" in model_out
+                        and "text_features" in model_out
+                        and "logit_scale" in model_out
+                    ):
+                        image_features = model_out["image_features"]
+                        text_features = model_out["text_features"]
+                        logit_scale = model_out["logit_scale"]
+                        # features are accumulated in CPU tensors, otherwise GPU memory exhausted quickly
+                        # however, system RAM is easily exceeded and compute time becomes problematic
+                        all_image_features.append(image_features.cpu())
+                        all_text_features.append(text_features.cpu())
+                        logit_scale = logit_scale.mean()
+                        logits_per_image = (
+                            logit_scale * image_features @ text_features.t()
+                        )
+                        logits_per_text = logits_per_image.t()
 
-                    auc_score = partial_auc(
-                        targets.cpu().numpy(), probs[:, 1].cpu().numpy()
-                    )
+                        labels = torch.arange(batch_size, device=device).long()
+                        total_loss = (
+                            F.cross_entropy(logits_per_image, labels)
+                            + F.cross_entropy(logits_per_text, labels)
+                        ) / 2
+                    else:
+                        logits = model_out
+                        total_loss = F.cross_entropy(logits, targets)
+                        probs = F.softmax(logits, dim=1)
+                        all_probs.append(probs.cpu())
 
-                cumulative_loss += auc_score * args.batch_size
-                num_samples += args.batch_size
-                if is_master(args) and (i % 100) == 0:
-                    logging.info(
+                if args.zero_shot:
+                    zero_shot_texts = tokenizer([
+                        "a photo of a benign skin lesion",
+                        "a photo of a malignant skin lesion",
+                    ])
+                    zero_shot_texts = torch.cat(
+                        [zero_shot_texts] * batch_size, dim=0
+                    ).to(device=device)
+                    zero_shot_logits = model(images, zero_shot_texts)
+                    zero_shot_probs = F.softmax(zero_shot_logits, dim=1)
+                    zero_shot_probs = zero_shot_probs.view(2, batch_size, -1)
+                    zero_shot_probs = zero_shot_probs.mean(dim=0)
+                    all_zero_shot_probs.append(zero_shot_probs.cpu())
+                cumulative_loss += total_loss * batch_size
+                num_samples += batch_size
+                if is_master(args) and (i % args.log_every_n_steps) == 0:
+                    logger.info(
                         f"Eval Epoch: {epoch} [{num_samples} / {samples_per_val}]\t"
-                        f"Clip Loss: {cumulative_loss / num_samples:.6f}\t"
+                        f"Loss: {cumulative_loss / num_samples:.6f}\t"
                     )
 
-            loss = cumulative_loss / num_samples
-            all_logits = torch.cat(all_logits, dim=0)
-            all_targets = torch.cat(all_targets, dim=0)
-            overall_auc = partial_auc(
-                all_targets.cpu().numpy(), all_logits[:, 1].numpy()
-            )
-            metrics.update(
-                {
-                    "overall_auc": overall_auc,
-                    "clip_val_loss": loss.item(),
-                    "epoch": epoch,
-                    "num_samples": num_samples,
-                }
-            )
+            metrics["val_loss"] = (cumulative_loss / num_samples).item()
+            if len(all_probs):
+                all_probs = torch.cat(all_probs, dim=0)
+                all_targets = torch.cat(all_targets, dim=0)
+                p_auc = partial_auc(all_targets.cpu().numpy(), all_probs[:, 1].numpy())
+                metrics["partial_auc"] = p_auc
+            metrics.update({
+                "epoch": epoch,
+                "num_samples": num_samples,
+            })
 
     if not metrics:
         return metrics
 
-    logging.info(
+    logger.info(
         f"Eval Epoch: {epoch} "
         + "\t".join([f"{k}: {round(v, 4):.4f}" for k, v in metrics.items()])
     )

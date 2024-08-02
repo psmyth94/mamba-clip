@@ -3,7 +3,6 @@ def main():
 
     from kaggle.api.kaggle_api_extended import KaggleApi
 
-    # %%
     api = KaggleApi()
     api.authenticate()
 
@@ -14,10 +13,9 @@ def main():
     )
     # unzip the dataset
 
-    # %%
     with zipfile.ZipFile("data/isic-2024-challenge.zip", "r") as zip_ref:
         zip_ref.extractall("data/isic-2024-challenge")
 
-    # %%
 if __name__ == '__main__':
     main()
+    # %%

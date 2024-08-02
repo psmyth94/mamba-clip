@@ -1,6 +1,9 @@
-from dataclasses import dataclass
-from io import BytesIO, TextIOWrapper
-from typing import Optional
+# type: ignore
+import os
+import sys
+from dataclasses import asdict, dataclass
+from io import BytesIO
+from typing import Any, Dict, Optional, Union
 
 import h5py
 import numpy as np
@@ -8,144 +11,202 @@ import pandas as pd
 import pandas.api.types
 import torch
 from open_clip import (
+    AugmentationCfg,
     SimpleTokenizer,
     create_model_from_pretrained,
     get_tokenizer,
 )
+from open_clip.constants import OPENAI_DATASET_MEAN, OPENAI_DATASET_STD
 from open_clip.tokenizer import HFTokenizer
-from open_clip.transform import PreprocessCfg, image_transform_v2
+from open_clip.transform import PreprocessCfg
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from isic.utils.dist_utils import is_master
+from sklearn.utils.class_weight import compute_class_weight
+from timm.data import create_transform
+from timm.data.transforms import CenterCropOrPad, ResizeKeepRatio
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, Sampler
+from torch.utils.data.sampler import WeightedRandomSampler
 from torchvision import transforms
-from tqdm.auto import tqdm
+from torchvision.transforms.transforms import InterpolationMode
 from transformers.convert_slow_tokenizer import Tokenizer
 
+from isic.model import ClipModel
+from isic.sampler import DistributedWeightedRandomSampler
+from isic.utils.data_utils import generate_report_v2
+from isic.utils import logging
 
-def generate_report(row, file: Optional[TextIOWrapper] = None, is_eval: bool = False):
-    age = row["age_approx"]
-    if np.isnan(age):
-        age = "unknown"
-    sex = row["sex"]
-    if sex is None:
-        sex = "unknown"
-    age_sex_info = ""
-    if age != "unknown" and sex != "unknown":
-        age_sex_info = f" of {age:.0f} years old {sex}"
-    elif age != "unknown":
-        age_sex_info = f" of {age:.0f} years old patient"
-    elif sex != "unknown":
-        age_sex_info = f" of a {sex} patient"
+logger = logging.get_logger(__name__)
 
-    lesion_size = row["clin_size_long_diam_mm"]
-    lesion_size_info = ""
-    if not np.isnan(lesion_size):
-        lesion_size_info = (
-            f"millimeters and a diameter of {lesion_size:.3f} millimeters. "
+
+def get_transform(aug_cfg: AugmentationCfg, pp_cfg: PreprocessCfg, is_train: bool):
+    interpolation = pp_cfg.interpolation
+    image_size = pp_cfg.size
+    fill_color = pp_cfg.fill_color
+
+    mean = pp_cfg.mean or OPENAI_DATASET_MEAN
+    if not isinstance(mean, (list, tuple)):
+        mean = (mean,) * 3
+
+    std = pp_cfg.std or OPENAI_DATASET_STD
+    if not isinstance(std, (list, tuple)):
+        std = (std,) * 3
+
+    interpolation = interpolation or "bicubic"
+    assert interpolation in ["bicubic", "bilinear", "random"]
+
+    interpolation = interpolation or "bicubic"
+    assert interpolation in ["bicubic", "bilinear", "random"]
+    # NOTE random is ignored for interpolation_mode, so defaults to BICUBIC for inference if set
+    interpolation_mode = (
+        InterpolationMode.BILINEAR
+        if interpolation == "bilinear"
+        else InterpolationMode.BICUBIC
+    )
+    normalize = transforms.Normalize(mean=mean, std=std)
+    if is_train:
+        if isinstance(aug_cfg, dict):
+            aug_cfg = AugmentationCfg(**aug_cfg)
+        else:
+            aug_cfg = aug_cfg or AugmentationCfg()
+
+        if isinstance(image_size, (tuple, list)):
+            assert len(image_size) >= 2
+            input_size = (3,) + image_size[-2:]
+        else:
+            input_size = (3, image_size, image_size)
+
+        aug_cfg_dict = {k: v for k, v in asdict(aug_cfg).items() if v is not None}
+
+        # not appropriate with medical images
+        aug_cfg_dict.setdefault("color_jitter", None)
+        aug_cfg_dict.pop("color_jitter_prob", None)
+        aug_cfg_dict.pop("gray_scale_prob", None)
+        aug_cfg_dict.pop("use_timm", None)
+        hflip = aug_cfg_dict.get("horizontal_flip", 0.5)
+
+        return create_transform(
+            input_size=input_size,
+            is_training=True,
+            hflip=hflip,
+            mean=mean,
+            std=std,
+            re_mode="pixel",
+            interpolation=interpolation,
+            **aug_cfg_dict,
         )
 
-    area = row["tbp_lv_areaMM2"]
-    area_info = ""
-    if not np.isnan(area):
-        area_info = f"The lesion has an area of {area:.3f} square "
+    interpolation_mode = "bilinear" if interpolation == "random" else interpolation
+    pipe = [
+        ResizeKeepRatio(image_size, interpolation=interpolation_mode, longest=1),
+        CenterCropOrPad(image_size, fill=fill_color),
+        lambda x: x.convert("RGB"),
+        transforms.ToTensor(),
+        normalize,
+    ]
+    return transforms.Compose(pipe)
 
-    perimeter = row["tbp_lv_perimeterMM"]
-    perimeter_info = ""
-    if not np.isnan(perimeter):
-        perimeter_info = f"The perimeter of the lesion is {perimeter:.3f} millimeters. "
 
-    eccentricity = row["tbp_lv_eccentricity"]
-    eccentricity_info = ""
-    if not np.isnan(eccentricity):
-        eccentricity_info = (
-            f"eccentricity of the lesion, indicating shape irregularity, is "
-            f"{eccentricity:.3f}. "
-        )
+def init_model(model, tokenizer=None, aug_cfg: Optional[Dict[str, Any]] = None):
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    border_irregularity = row["tbp_lv_norm_border"]
-    border_irregularity_info = ""
-    if not np.isnan(border_irregularity):
-        border_irregularity_info = (
-            f"Border irregularity is rated at {border_irregularity:.3f} on a scale of 0 to "
-            "10. "
-        )
+    medmamba_b = VSSM(depths=[2, 2, 12, 2], dims=[128, 256, 512, 1024], num_classes=2)
+    if isinstance(model, str):
+        tokenizer = tokenizer or model
+        model, _ = create_model_from_pretrained(f"hf-hub:{model}")
+    elif callable(model):
+        model = model()
 
-    color_variation = row["tbp_lv_norm_color"]
-    color_variation_info = ""
-    if not np.isnan(color_variation):
-        color_variation_info = (
-            f"Color variation within the lesion is rated at {color_variation:.3f} on a "
-            "scale of 0 to 10. "
-        )
+    if isinstance(tokenizer, str):
+        tokenizer = get_tokenizer(f"hf-hub:{tokenizer}")
+    elif callable(tokenizer):
+        tokenizer = tokenizer()
 
-    anatom_site = row["anatom_site_general"]
+    pp_cfg = None
+    if hasattr(model, "visual") and hasattr(model.visual, "preprocess_cfg"):
+        pp_cfg = PreprocessCfg(**model.visual.preprocess_cfg)
 
-    report = (
-        f"A photo was taken of a skin lesion located on the {anatom_site}{age_sex_info}"
-        ". The patient suspects skin cancer. "
-        f"{area_info}"
-        f"{lesion_size_info}"
-        f"{perimeter_info}"
-        f"{eccentricity_info}"
-        f"{border_irregularity_info}"
-        f"{color_variation_info}"
-    ).strip()
-    if "target" in row:
-        target = "malignant" if row["target"] == 1 else "benign"
-        report += (
-            f" Based on the image and the description, the lesion is likely {target}."
-        )
-    if file is not None:
-        isic_id = row["isic_id"]
-        file.write(f"{isic_id}\t{report}\n")
-    if "target" in row and not is_eval:
-        return report
+    preprocess_train = get_transform(aug_cfg, pp_cfg, is_train=True)
+    preprocess_val = get_transform(aug_cfg, pp_cfg, is_train=False)
+    return ClipModel(model), preprocess_train, preprocess_val, tokenizer
+
+
+def get_sampling_probabilities(class_count, mode="instance", ep=None, n_eps=None):
+    """
+    Note that for progressive sampling I use n_eps-1, which I find more intuitive.
+    If you are training for 10 epochs, you pass n_eps=10 to this function. Then, inside
+    the training loop you would have sth like 'for ep in range(n_eps)', so ep=0,...,9,
+    and all fits together.
+    """
+    if mode == "instance":
+        q = 0
+    elif mode == "class":
+        q = 1
+    elif mode == "sqrt":
+        q = 0.5  # 1/2
+    elif mode == "cbrt":
+        q = 0.125  # 1/8
+    elif mode == "prog":
+        assert (
+            ep is not None and n_eps is not None
+        ), "progressive sampling requires to pass values for ep and n_eps"
+        relative_freq_imbal = class_count**0 / (class_count**0).sum()
+        relative_freq_bal = class_count**1 / (class_count**1).sum()
+        sampling_probabilities_imbal = relative_freq_imbal ** (-1)
+        sampling_probabilities_bal = relative_freq_bal ** (-1)
+        return (1 - ep / (n_eps - 1)) * sampling_probabilities_imbal + (
+            ep / (n_eps - 1)
+        ) * sampling_probabilities_bal
     else:
-        report1 = (
-            report
-            + " Based on the image and the description, the lesion is likely benign."
+        sys.exit("not a valid mode")
+
+    relative_freq = class_count**q / (class_count**q).sum()
+    sampling_probabilities = relative_freq ** (-1)
+
+    return sampling_probabilities
+
+
+def modify_loader(loader, mode, ep=None, n_eps=None, distributed=False):
+    class_count = np.unique(loader.dataset.targets, return_counts=True)[1]
+    sampling_probs = get_sampling_probabilities(
+        class_count, mode=mode, ep=ep, n_eps=n_eps
+    )
+    sample_weights = sampling_probs[loader.dataset.targets]
+
+    if distributed:
+        mod_sampler = DistributedWeightedRandomSampler(
+            weights=sample_weights, num_samples=len(sample_weights)
         )
-        report2 = (
-            report
-            + " Based on the image and the description, the lesion is likely malignant."
+    else:
+        mod_sampler = WeightedRandomSampler(
+            weights=sample_weights, num_samples=len(sample_weights)
         )
-        return report1, report2
-
-
-def generate_reports(metadata, path):
-    with open(path, "w") as file:
-        file.write("isic_id\treport\n")
-        for _, row in tqdm(metadata.iterrows(), total=metadata.shape[0]):
-            generate_report(row, file)
-
-
-def init_model():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    clip_model, _ = create_model_from_pretrained(
-        "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
-    )  # type: ignore
-    tokenizer = get_tokenizer(
-        "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+    mod_loader = DataLoader(
+        loader.dataset,
+        batch_size=loader.batch_size,
+        sampler=mod_sampler,
+        num_workers=loader.num_workers,
     )
-    pp_cfg = PreprocessCfg(**clip_model.visual.preprocess_cfg)
-    aug_cfg = None
-    preprocess_train = image_transform_v2(
-        pp_cfg,
-        is_train=True,
-        aug_cfg=aug_cfg,
-    )
-    preprocess_val = image_transform_v2(
-        pp_cfg,
-        is_train=False,
-    )
-    return clip_model.to(device), preprocess_train, preprocess_val, tokenizer
+    return mod_loader, mod_sampler
+
+
+def get_combo_loader(loader, base_sampling="instance", distributed=False):
+    if base_sampling == "instance":
+        imbalanced_loader = loader
+    else:
+        imbalanced_loader, _ = modify_loader(
+            loader, mode=base_sampling, distributed=distributed
+        )
+
+    balanced_loader, _ = modify_loader(loader, mode="class", distributed=distributed)
+    combo_loader = ComboLoader([imbalanced_loader, balanced_loader])
+    return combo_loader
 
 
 @dataclass
 class DataInfo:
     dataloader: DataLoader
-    sampler = None
-    shared_epoch = None
+    sampler: Optional[Sampler] = None
+    shared_epoch: Optional[torch.Tensor] = None
 
     def set_epoch(self, epoch):
         if self.shared_epoch is not None:
@@ -154,22 +215,77 @@ class DataInfo:
             self.sampler.set_epoch(epoch)
 
 
+class ComboIter(object):
+    """An iterator."""
+
+    def __init__(self, my_loader):
+        self.my_loader = my_loader
+        self.loader_iters = [iter(loader) for loader in self.my_loader.loaders]
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        # When the shortest loader (the one with minimum number of batches)
+        # terminates, this iterator will terminates.
+        # The `StopIteration` raised inside that shortest loader's `__next__`
+        # method will in turn gets out of this `__next__` method.
+        batches = [next(loader_iter) for loader_iter in self.loader_iters]
+        return self.my_loader.combine_batch(batches)
+
+    def __len__(self):
+        return len(self.my_loader)
+
+
+class ComboLoader(object):
+    """This class wraps several pytorch DataLoader objects, allowing each time
+    taking a batch from each of them and then combining these several batches
+    into one. This class mimics the `for batch in loader:` interface of
+    pytorch `DataLoader`.
+    Args:
+    loaders: a list or tuple of pytorch DataLoader objects
+    """
+
+    def __init__(self, loaders):
+        self.loaders = loaders
+        self.dataset = loaders[0].dataset
+
+    def __iter__(self):
+        return ComboIter(self)
+
+    def __len__(self):
+        return min([len(loader) for loader in self.loaders])
+
+    # Customize the behavior of combining batches here.
+    def combine_batch(self, batches):
+        return batches
+
+
 class IsicChallengeDataset(Dataset):
     def __init__(
         self,
-        hdf5_path: str,
+        data_path: str,
         metadata_or_path: str,
-        tokenizer: SimpleTokenizer | HFTokenizer | Tokenizer = None,
+        tokenizer: Union[SimpleTokenizer, HFTokenizer, Tokenizer] = None,
         transform: Optional[transforms.Compose] = None,
         is_train: bool = False,
+        include_target: bool = False,
+        small_test: bool = False,
     ):
         """
         Args:
-            hdf5_path (string): Path to the hdf5 file with image data.
-            csv_path (string): Path to the csv file with text data.
+            data_path (string): Path to the hdf5 file with image data or to the directory
+            with images.
+            metadata_or_path (string): Path to the csv file with text data or the pandas
+            dataframe with text data.
+            tokenizer (callable, optional): Optional tokenizer to be applied on the
+            text.
             transform (callable, optional): Optional transform to be applied on an image.
+            is_train (bool): Whether the dataset is for training or evaluation.
         """
-        self.hdf5_path = hdf5_path
+        self.data_path = data_path
+        if data_path.endswith(".h5") or data_path.endswith(".hdf5"):
+            self.data_path = data_path
         if isinstance(metadata_or_path, str):
             self.metadata_path = metadata_or_path
             self.text_data = pd.read_csv(metadata_or_path).set_index("isic_id")
@@ -183,83 +299,317 @@ class IsicChallengeDataset(Dataset):
 
         self.indices = self.text_data.index
         if "target" in self.text_data.columns:
-            self.targets = self.text_data["target"].values
+            self.targets = self.text_data["target"].values.tolist()
         else:
             self.targets = None
 
         # Open the HDF5 file
-        self.hdf5_file = h5py.File(hdf5_path, "r")
+        self.hdf5_file = None
+        if data_path.endswith(".h5") or data_path.endswith(".hdf5"):
+            self.hdf5_file = h5py.File(data_path, "r", libver="latest", swmr=True)
         self.tokenizer = tokenizer
 
         self.is_train = is_train
+        self.small_test = small_test
+        self.include_target = include_target
 
     def __len__(self):
-        return len(self.text_data)
+        return len(self.indices)
 
-    def _load_image(self, idx):
-        image: bytes = self.hdf5_file[idx][()]  # type: ignore
+    def _load_hdf5(self, idx):
+        image: bytes = self.hdf5_file[idx][()]
 
         image_bytes = BytesIO(image)
-        image = Image.open(image_bytes)  # type: ignore
+        image = Image.open(image_bytes)
         if self.transform:
             image = self.transform(image)
         return image
 
+    def _load_image(self, idx):
+        if self.data_path.endswith(".h5") or self.data_path.endswith(".hdf5"):
+            return self._load_hdf5(idx)
+        if isinstance(idx, str):
+            image_path = os.path.join(self.data_path, f"{idx}.jpg")
+            image = Image.open(image_path)
+            if self.transform:
+                image = self.transform(image)
+            return image
+
     def _get_text(self, text: str):
         tokens = None
         if isinstance(self.tokenizer, HFTokenizer):
-            tokens = self.tokenizer(text)[0]
+            tokens = self.tokenizer(text)
         elif isinstance(self.tokenizer, SimpleTokenizer):
             tokens = self.tokenizer.encode(text)
         elif isinstance(self.tokenizer, Tokenizer):
             tokens = self.tokenizer.encode(text)
         else:
             raise ValueError("Tokenizer not recognized")
+        if tokens.shape[0] == 1 and len(tokens.shape) == 2:
+            tokens = tokens[0]
         return tokens
 
     def __getitem__(self, idx):
-        if torch.is_tensor(idx):
-            idx = [self.indices[i] for i in idx.tolist()]
-        else:
-            idx = self.indices[idx]
+        ids = self.indices[idx]
 
         # Get image
-        image = self._load_image(idx)
+        image = self._load_image(ids)
 
         # Get text
-        batch = self.text_data.loc[idx]
+        batch = self.text_data.loc[ids]
 
         pos_texts = []
         neg_texts = []
 
-        targets = []
-        if isinstance(idx, list) or torch.is_tensor(idx):
-            for _, row in batch.iterrows():
-                if self.is_train:
-                    targets.append(generate_report(row, is_eval=False))
-                else:
-                    neg_txt, pos_txt = generate_report(row, is_eval=True)
-                    pos_texts.append(pos_txt)
-                    neg_texts.append(neg_txt)
-                    targets.append(row["target"])
+        target_text = []
+        if self.is_train:
+            target_text.append(
+                generate_report_v2(
+                    batch,
+                    is_eval=False,
+                    include_target=self.include_target,
+                    shuffle=True,
+                    dropout=0.1,
+                )
+            )
+
         else:
-            if self.is_train:
-                targets.append(generate_report(batch, is_eval=False))
-            else:
-                neg_txt, pos_txt = generate_report(batch, is_eval=True)
+            texts = generate_report_v2(
+                batch, is_eval=True, include_target=self.include_target
+            )
+            if isinstance(texts, tuple):
+                neg_txt, pos_txt = texts
                 pos_texts.append(pos_txt)
                 neg_texts.append(neg_txt)
-                targets.append(batch["target"])
+                target_text.append(batch["target"])
+            else:
+                target_text.append(texts)
 
-        if self.is_train:
-            return image, self._get_text(targets)  # , self._get_text(text[1])
-        else:
+        targets = None
+        if self.targets is not None:
+            targets = torch.tensor(self.targets[idx])
+        if len(neg_texts) and len(pos_texts):
             return (
                 image,
                 self._get_text(neg_texts),
                 self._get_text(pos_texts),
-                torch.tensor(targets),
+                torch.tensor(target_text),
+            )
+        else:
+            return (
+                image,
+                self._get_text(target_text),
+                targets,
             )
 
     def close(self):
         self.hdf5_file.close()
+
+
+def train_test_split(data, test_size=0.2, random_state=None, stratify=None):
+    """
+    Splits the data into training and testing sets.
+
+    Parameters:
+    data (array-like): The data to split.
+    test_size (float or int): If float, should be between 0.0 and 1.0 and represent the proportion of the dataset to include in the test split. If int, represents the absolute number of test samples.
+    random_state (int): Controls the shuffling applied to the data before applying the split. Pass an int for reproducible output across multiple function calls.
+    stratify (array-like): If not None, data is split in a stratified fashion, using this as the class labels.
+
+    Returns:
+    train (array-like): Training set.
+    test (array-like): Test set.
+    """
+    if stratify is not None:
+        unique_classes, y_indices = np.unique(stratify, return_inverse=True)
+        train_indices = []
+        test_indices = []
+
+        for class_index in unique_classes:
+            class_mask = y_indices == class_index
+            class_data_indices = np.where(class_mask)[0]
+
+            if random_state is not None:
+                np.random.seed(random_state)
+
+            np.random.shuffle(class_data_indices)
+
+            if isinstance(test_size, float):
+                n_test = int(len(class_data_indices) * test_size)
+            else:
+                n_test = test_size
+
+            test_indices.extend(class_data_indices[:n_test])
+            train_indices.extend(class_data_indices[n_test:])
+    else:
+        indices = np.arange(len(data))
+        if random_state is not None:
+            np.random.seed(random_state)
+
+        np.random.shuffle(indices)
+
+        if isinstance(test_size, float):
+            n_test = int(len(data) * test_size)
+        else:
+            n_test = test_size
+
+        test_indices = indices[:n_test]
+        train_indices = indices[n_test:]
+
+    train_data = data.loc[train_indices, :]
+    test_data = data.loc[test_indices, :]
+
+    return train_data, test_data
+
+
+def get_data(args, preprocess_train, preprocess_val, tokenizer):
+    if is_master(args):
+        logger.info("Loading data...")
+    # Create dataset
+    test_dataset_path = args.data_path + "test-image.hdf5"
+    test_metadata_path = args.data_path + "test-metadata.csv"
+    if is_master(args):
+        logger.info(f"Loading test dataset from {test_dataset_path}")
+    test_dataset = IsicChallengeDataset(
+        data_path=test_dataset_path,
+        metadata_or_path=test_metadata_path,
+        tokenizer=tokenizer,
+        transform=preprocess_val,
+        is_train=False,
+    )
+    num_test_samples = len(test_dataset)
+
+    test_data_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        pin_memory=True,
+        num_workers=args.workers,
+        drop_last=False,
+    )
+    test_data_loader.num_samples = num_test_samples
+    test_data_loader.num_batches = len(test_data_loader)
+
+    test_data = DataInfo(test_data_loader)
+
+    train_dataset_path = args.data_path + "train-image/image"
+    train_metadata_path = args.data_path + "train-metadata.csv"
+    train_metadata = pd.read_csv(train_metadata_path)
+    # stratify by target
+    targets = train_metadata["target"]
+    if is_master(args):
+        logger.info(f"Loding train dataset from {train_dataset_path}")
+        logger.info(f"Stratifying by target: {targets.value_counts()}")
+
+    train_metadata, val_metadata = train_test_split(
+        train_metadata, test_size=0.2, stratify=targets, random_state=args.seed
+    )
+    if args.undersample:
+
+        def select_interesting_samples(tbl, n=None, col=None, sort_by=None):
+            if n is None:
+                return tbl
+            if sort_by is not None and col is not None:
+                if sort_by == "asc":
+                    tbl = tbl.sort_values(col)
+                elif sort_by == "desc":
+                    tbl = tbl.sort_values(col, ascending=False)
+                elif "/" in sort_by:
+                    n_0_p, n_1_p = map(int, sort_by.split("/"))
+                    n_0_p = n_0_p / (n_0_p + n_1_p)
+                    n_0 = int(n * n_0_p)
+                    n_1 = n - n_0
+                    tbl = tbl.sort_values(col)
+                    tbl_0 = tbl.head(n_0)
+                    tbl_1 = tbl.tail(n_1)
+                    return pd.concat([tbl_0, tbl_1])
+                elif sort_by == "uniform":
+                    tbl = tbl.sort_values(col)
+                    steps = len(tbl) // args.undersample
+                    return tbl.iloc[::steps]
+                else:
+                    raise ValueError(f"Unknown sort_by value: {sort_by}")
+                return tbl.head(n)
+            return tbl.sample(n=n, replace=False)
+
+        new_train_metadata = []
+        for c in train_metadata["target"].unique():
+            tbl = train_metadata[train_metadata["target"] == c]
+            n_samples = args.undersample if args.undersample < len(tbl) else None
+            new_train_metadata.append(
+                select_interesting_samples(
+                    tbl,
+                    n_samples,
+                    col=args.undersample_by,
+                    sort_by=args.undersample_sort_by,
+                )
+            )
+        new_train_metadata = pd.concat(new_train_metadata)
+        if args.add_remaining_samples:
+            index_to_add = list(
+                set(list(train_metadata.index)) - set(list(new_train_metadata.index))
+            )
+            val_metadata = pd.concat([val_metadata, train_metadata.loc[index_to_add]])
+        train_metadata = new_train_metadata
+    if isinstance(args.class_weighted_loss, bool) and args.class_loss_weight:
+        args.class_weighted_loss = compute_class_weight(
+            "balanced", classes=np.unique(targets), y=targets
+        )
+
+    train_dataset = IsicChallengeDataset(
+        data_path=train_dataset_path,
+        metadata_or_path=train_metadata,
+        tokenizer=tokenizer,
+        transform=preprocess_train,
+        is_train=True,
+        include_target=args.stage == 1,
+        small_test=args.small_test,
+    )
+
+    val_dataset = IsicChallengeDataset(
+        data_path=train_dataset_path,
+        metadata_or_path=val_metadata,
+        tokenizer=tokenizer,
+        transform=preprocess_val,
+        is_train=False,
+        include_target=args.stage == 1,
+        small_test=args.small_test,
+    )
+
+    num_train_samples = len(train_dataset)
+    num_val_samples = len(val_dataset)
+
+    train_sampler = None
+    if args.distributed:
+        train_sampler = DistributedSampler(train_dataset)
+    shuffle = not args.distributed
+    train_data_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=shuffle,
+        sampler=train_sampler,
+        pin_memory=True,
+        num_workers=args.workers,
+        drop_last=True,
+    )
+    train_data_loader.num_samples = num_train_samples
+    train_data_loader.num_batches = len(train_data_loader)
+
+    train_data = DataInfo(train_data_loader)
+
+    num_val_samples = len(val_dataset)
+
+    val_data_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        pin_memory=True,
+        num_workers=args.workers,
+        drop_last=False,
+    )
+    val_data_loader.num_samples = num_val_samples
+    val_data_loader.num_batches = len(val_data_loader)
+
+    val_data = DataInfo(val_data_loader)
+
+    data = {"val": val_data}
+    return data
