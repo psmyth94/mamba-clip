@@ -437,6 +437,4 @@ def arg_parser() -> Args:
 # %%
 if __name__ == "__main__":
     args = arg_parser()
-    # pre-training
     pipeline(args)
-    # %%
