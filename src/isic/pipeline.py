@@ -492,7 +492,10 @@ def pipeline(args):
                 world_size=args.world_size,
             )
         else:
-            loss = cross_entropy_loss
+            if args.class_weighted_loss is not None:
+                loss = partial(cross_entropy_loss, weight=args.class_weighted_loss)
+            else:
+                loss = cross_entropy_loss
 
         resume_latest = args.resume == "latest"
         if "train" not in data:

@@ -434,6 +434,7 @@ def arg_parser() -> Args:
     args = parser.parse_args()
     return Args(**vars(args))
 
+
 def main():
     logger_setup()
     args = arg_parser()
@@ -441,6 +442,7 @@ def main():
     args.model_stage_1 = "medmamba"
     args.small_test = True
     pipeline(args)
+
 
 # %%
 if __name__ == "__main__":
