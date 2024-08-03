@@ -334,11 +334,11 @@ class IsicChallengeDataset(Dataset):
         # Get image
         image = self._load_image(ids)
 
-        if self.tokenizer is None:
-            return image
         # Get text
         batch = self.text_data.loc[ids]
 
+        if self.tokenizer is None:
+            return image, torch.tensor(batch["target"])
         pos_texts = []
         neg_texts = []
 
@@ -592,5 +592,5 @@ def get_data(args, preprocess_train, preprocess_val, tokenizer):
 
     val_data = DataInfo(val_data_loader)
 
-    data = {"val": val_data}
+    data = {"train": train_data, "val": val_data}
     return data

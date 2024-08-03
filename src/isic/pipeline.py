@@ -486,13 +486,16 @@ def pipeline(args):
         setup_paths(args)
         setup_train(args, checkpoint_prefix=f"stage_{args.stage}_")
         params, args = prepare_params(model_stage_1, data, args)
-        loss = ClipLoss(
-            local_loss=args.local_loss,
-            gather_with_grad=args.gather_with_grad,
-            cache_labels=True,
-            rank=args.rank,
-            world_size=args.world_size,
-        )
+        if tokenizer is not None:
+            loss = ClipLoss(
+                local_loss=args.local_loss,
+                gather_with_grad=args.gather_with_grad,
+                cache_labels=True,
+                rank=args.rank,
+                world_size=args.world_size,
+            )
+        else:
+            loss = cross_entropy_loss
 
         resume_latest = args.resume == "latest"
         if "train" not in data:
