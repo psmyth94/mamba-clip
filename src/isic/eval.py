@@ -70,14 +70,25 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
         all_targets = []
         with torch.inference_mode():
             for i, batch in enumerate(dataloader):
-                images, texts, targets = batch
+                if len(batch) == 2:
+                    images, targets = batch
+                    texts = None
+                else:
+                    images, texts, targets = batch
                 images = images.to(device=device, dtype=input_dtype, non_blocking=True)
-                texts = texts.to(device=device, non_blocking=True)
+                texts = (
+                    texts.to(device=device, non_blocking=True)
+                    if texts is not None
+                    else None
+                )
                 targets = targets.to(device=device, non_blocking=True)
                 all_targets.append(targets.cpu())
 
                 with autocast():
-                    model_out = model(images, texts)
+                    if texts is not None:
+                        model_out = model(images, texts)
+                    else:
+                        model_out = model(images)
                     batch_size = images.shape[0]
                     if (
                         isinstance(model_out, dict)
