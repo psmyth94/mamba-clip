@@ -3,7 +3,7 @@ import os
 import sys
 from dataclasses import asdict, dataclass
 from io import BytesIO
-from typing import Any, Dict, Optional, Union
+from typing import Optional, Union
 
 import h5py
 import numpy as np
@@ -13,14 +13,11 @@ import torch
 from open_clip import (
     AugmentationCfg,
     SimpleTokenizer,
-    create_model_from_pretrained,
-    get_tokenizer,
 )
 from open_clip.constants import OPENAI_DATASET_MEAN, OPENAI_DATASET_STD
 from open_clip.tokenizer import HFTokenizer
 from open_clip.transform import PreprocessCfg
 from PIL import Image
-from isic.utils.dist_utils import is_master
 from sklearn.utils.class_weight import compute_class_weight
 from timm.data import create_transform
 from timm.data.transforms import CenterCropOrPad, ResizeKeepRatio
@@ -30,15 +27,21 @@ from torchvision import transforms
 from torchvision.transforms.transforms import InterpolationMode
 from transformers.convert_slow_tokenizer import Tokenizer
 
-from isic.model import ClipModel
 from isic.sampler import DistributedWeightedRandomSampler
-from isic.utils.data_utils import generate_report_v2
 from isic.utils import logging
+from isic.utils.data_utils import generate_report_v2
+from isic.utils.dist_utils import is_master
 
 logger = logging.get_logger(__name__)
 
 
-def get_transform(aug_cfg: AugmentationCfg, pp_cfg: PreprocessCfg, is_train: bool):
+def get_transform(
+    aug_cfg: Optional[Union[AugmentationCfg, dict]] = None,
+    pp_cfg: Optional[PreprocessCfg] = None,
+    is_train: bool = False,
+):
+    if pp_cfg is None:
+        pp_cfg = PreprocessCfg()
     interpolation = pp_cfg.interpolation
     image_size = pp_cfg.size
     fill_color = pp_cfg.fill_color
@@ -104,30 +107,6 @@ def get_transform(aug_cfg: AugmentationCfg, pp_cfg: PreprocessCfg, is_train: boo
         normalize,
     ]
     return transforms.Compose(pipe)
-
-
-def init_model(model, tokenizer=None, aug_cfg: Optional[Dict[str, Any]] = None):
-    # device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    medmamba_b = VSSM(depths=[2, 2, 12, 2], dims=[128, 256, 512, 1024], num_classes=2)
-    if isinstance(model, str):
-        tokenizer = tokenizer or model
-        model, _ = create_model_from_pretrained(f"hf-hub:{model}")
-    elif callable(model):
-        model = model()
-
-    if isinstance(tokenizer, str):
-        tokenizer = get_tokenizer(f"hf-hub:{tokenizer}")
-    elif callable(tokenizer):
-        tokenizer = tokenizer()
-
-    pp_cfg = None
-    if hasattr(model, "visual") and hasattr(model.visual, "preprocess_cfg"):
-        pp_cfg = PreprocessCfg(**model.visual.preprocess_cfg)
-
-    preprocess_train = get_transform(aug_cfg, pp_cfg, is_train=True)
-    preprocess_val = get_transform(aug_cfg, pp_cfg, is_train=False)
-    return ClipModel(model), preprocess_train, preprocess_val, tokenizer
 
 
 def get_sampling_probabilities(class_count, mode="instance", ep=None, n_eps=None):
@@ -344,7 +323,7 @@ class IsicChallengeDataset(Dataset):
         elif isinstance(self.tokenizer, Tokenizer):
             tokens = self.tokenizer.encode(text)
         else:
-            raise ValueError("Tokenizer not recognized")
+            return None
         if tokens.shape[0] == 1 and len(tokens.shape) == 2:
             tokens = tokens[0]
         return tokens
@@ -355,6 +334,8 @@ class IsicChallengeDataset(Dataset):
         # Get image
         image = self._load_image(ids)
 
+        if self.tokenizer is None:
+            return image
         # Get text
         batch = self.text_data.loc[ids]
 
@@ -550,7 +531,7 @@ def get_data(args, preprocess_train, preprocess_val, tokenizer):
             )
             val_metadata = pd.concat([val_metadata, train_metadata.loc[index_to_add]])
         train_metadata = new_train_metadata
-    if isinstance(args.class_weighted_loss, bool) and args.class_loss_weight:
+    if isinstance(args.class_weighted_loss, bool) and args.class_weighted_loss:
         args.class_weighted_loss = compute_class_weight(
             "balanced", classes=np.unique(targets), y=targets
         )

@@ -107,21 +107,10 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
                         logits = model_out
                         total_loss = F.cross_entropy(logits, targets)
                         probs = F.softmax(logits, dim=1)
+                        if probs.shape[1] == 1:
+                            probs = torch.cat([1 - probs, probs], dim=1)
                         all_probs.append(probs.cpu())
 
-                if args.zero_shot:
-                    zero_shot_texts = tokenizer([
-                        "a photo of a benign skin lesion",
-                        "a photo of a malignant skin lesion",
-                    ])
-                    zero_shot_texts = torch.cat(
-                        [zero_shot_texts] * batch_size, dim=0
-                    ).to(device=device)
-                    zero_shot_logits = model(images, zero_shot_texts)
-                    zero_shot_probs = F.softmax(zero_shot_logits, dim=1)
-                    zero_shot_probs = zero_shot_probs.view(2, batch_size, -1)
-                    zero_shot_probs = zero_shot_probs.mean(dim=0)
-                    all_zero_shot_probs.append(zero_shot_probs.cpu())
                 cumulative_loss += total_loss * batch_size
                 num_samples += batch_size
                 if is_master(args) and (i % args.log_every_n_steps) == 0:

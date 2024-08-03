@@ -151,7 +151,7 @@ def arg_parser() -> Args:
 
     parser.add_argument(
         "--add-remaining-samples",
-        type="store_true",
+        action="store_true",
         help="Add remaining samples removed from undersampling to the validation set",
     )
     parser.add_argument("--balanced-mixup", type=float, help="Learning rate")
@@ -437,4 +437,8 @@ def arg_parser() -> Args:
 # %%
 if __name__ == "__main__":
     args = arg_parser()
+    args.stage = 1
+    args.model_stage_1 = "medmamba"
+    args.small_test = True
     pipeline(args)
+    # %%

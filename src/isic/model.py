@@ -1,11 +1,12 @@
 # type: ignore
 import math
 from functools import partial
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from mamba_ssm.ops.selective_scan_interface import rearrange, repeat
 from open_clip import (
     CustomTextCLIP,
     create_model_from_pretrained,
@@ -13,6 +14,13 @@ from open_clip import (
 )
 from open_clip.transform import PreprocessCfg
 from open_clip_train.train import unwrap_model
+from timm.layers.drop import DropPath
+from torch.functional import Tensor
+from torch.nn.init import trunc_normal_
+from torch.utils import checkpoint
+
+from .data import get_transform
+from .utils import logging
 
 try:
     from mamba_ssm.ops.selective_scan_interface import (
@@ -28,6 +36,8 @@ except ImportError:
     pass
 
 DropPath.__repr__ = lambda self: f"timm.DropPath({self.drop_prob})"
+
+logger = logging.get_logger(__name__)
 
 
 def flops_selective_scan_ref(
@@ -160,13 +170,13 @@ def flops_selective_scan_ref(
     return flops
 
 
-class PatchEmbed2D(nn.Module):
+class PatchEmbed2D(torch.nn.Module):
     r"""Image to Patch Embedding
     Args:
         patch_size (int): Patch token size. Default: 4.
         in_chans (int): Number of input image channels. Default: 3.
         embed_dim (int): Number of linear projection output channels. Default: 96.
-        norm_layer (nn.Module, optional): Normalization layer. Default: None
+        norm_layer (torch.nn.Module, optional): Normalization layer. Default: None
     """
 
     def __init__(
@@ -175,7 +185,7 @@ class PatchEmbed2D(nn.Module):
         super().__init__()
         if isinstance(patch_size, int):
             patch_size = (patch_size, patch_size)
-        self.proj = nn.Conv2d(
+        self.proj = torch.nn.Conv2d(
             in_chans, embed_dim, kernel_size=patch_size, stride=patch_size
         )
         if norm_layer is not None:
@@ -190,18 +200,18 @@ class PatchEmbed2D(nn.Module):
         return x
 
 
-class PatchMerging2D(nn.Module):
+class PatchMerging2D(torch.nn.Module):
     r"""Patch Merging Layer.
     Args:
         input_resolution (tuple[int]): Resolution of input feature.
         dim (int): Number of input channels.
-        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+        norm_layer (torch.nn.Module, optional): Normalization layer.  Default: torch.nn.LayerNorm
     """
 
-    def __init__(self, dim, norm_layer=nn.LayerNorm):
+    def __init__(self, dim, norm_layer=torch.nn.LayerNorm):
         super().__init__()
         self.dim = dim
-        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
+        self.reduction = torch.nn.Linear(4 * dim, 2 * dim, bias=False)
         self.norm = norm_layer(4 * dim)
 
     def forward(self, x):
@@ -235,16 +245,16 @@ class PatchMerging2D(nn.Module):
         return x
 
 
-class PatchExpand2D(nn.Module):
-    def __init__(self, dim, dim_scale=2, norm_layer=nn.LayerNorm):
+class PatchExpand2D(torch.nn.Module):
+    def __init__(self, dim, dim_scale=2, norm_layer=torch.nn.LayerNorm):
         super().__init__()
         self.dim = dim * 2
         self.dim_scale = dim_scale
-        self.expand = nn.Linear(self.dim, dim_scale * self.dim, bias=False)
+        self.expand = torch.nn.Linear(self.dim, dim_scale * self.dim, bias=False)
         self.norm = norm_layer(self.dim // dim_scale)
 
     def forward(self, x):
-        B, H, W, C = x.shape
+        _, _, _, C = x.shape
         x = self.expand(x)
 
         x = rearrange(
@@ -259,16 +269,16 @@ class PatchExpand2D(nn.Module):
         return x
 
 
-class Final_PatchExpand2D(nn.Module):
-    def __init__(self, dim, dim_scale=4, norm_layer=nn.LayerNorm):
+class Final_PatchExpand2D(torch.nn.Module):
+    def __init__(self, dim, dim_scale=4, norm_layer=torch.nn.LayerNorm):
         super().__init__()
         self.dim = dim
         self.dim_scale = dim_scale
-        self.expand = nn.Linear(self.dim, dim_scale * self.dim, bias=False)
+        self.expand = torch.nn.Linear(self.dim, dim_scale * self.dim, bias=False)
         self.norm = norm_layer(self.dim // dim_scale)
 
     def forward(self, x):
-        B, H, W, C = x.shape
+        _, _, _, C = x.shape
         x = self.expand(x)
 
         x = rearrange(
@@ -283,7 +293,7 @@ class Final_PatchExpand2D(nn.Module):
         return x
 
 
-class SS2D(nn.Module):
+class SS2D(torch.nn.Module):
     def __init__(
         self,
         d_model,
@@ -314,10 +324,10 @@ class SS2D(nn.Module):
         self.d_inner = int(self.expand * self.d_model)
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
 
-        self.in_proj = nn.Linear(
+        self.in_proj = torch.nn.Linear(
             self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs
         )
-        self.conv2d = nn.Conv2d(
+        self.conv2d = torch.nn.Conv2d(
             in_channels=self.d_inner,
             out_channels=self.d_inner,
             groups=self.d_inner,
@@ -326,35 +336,35 @@ class SS2D(nn.Module):
             padding=(d_conv - 1) // 2,
             **factory_kwargs,
         )
-        self.act = nn.SiLU()
+        self.act = torch.nn.SiLU()
 
         self.x_proj = (
-            nn.Linear(
+            torch.nn.Linear(
                 self.d_inner,
                 (self.dt_rank + self.d_state * 2),
                 bias=False,
                 **factory_kwargs,
             ),
-            nn.Linear(
+            torch.nn.Linear(
                 self.d_inner,
                 (self.dt_rank + self.d_state * 2),
                 bias=False,
                 **factory_kwargs,
             ),
-            nn.Linear(
+            torch.nn.Linear(
                 self.d_inner,
                 (self.dt_rank + self.d_state * 2),
                 bias=False,
                 **factory_kwargs,
             ),
-            nn.Linear(
+            torch.nn.Linear(
                 self.d_inner,
                 (self.dt_rank + self.d_state * 2),
                 bias=False,
                 **factory_kwargs,
             ),
         )
-        self.x_proj_weight = nn.Parameter(
+        self.x_proj_weight = torch.nn.Parameter(
             torch.stack([t.weight for t in self.x_proj], dim=0)
         )  # (K=4, N, inner)
         del self.x_proj
@@ -401,10 +411,10 @@ class SS2D(nn.Module):
                 **factory_kwargs,
             ),
         )
-        self.dt_projs_weight = nn.Parameter(
+        self.dt_projs_weight = torch.nn.Parameter(
             torch.stack([t.weight for t in self.dt_projs], dim=0)
         )  # (K=4, inner, rank)
-        self.dt_projs_bias = nn.Parameter(
+        self.dt_projs_bias = torch.nn.Parameter(
             torch.stack([t.bias for t in self.dt_projs], dim=0)
         )  # (K=4, inner)
         del self.dt_projs
@@ -417,11 +427,11 @@ class SS2D(nn.Module):
         # self.selective_scan = selective_scan_fn
         self.forward_core = self.forward_corev0
 
-        self.out_norm = nn.LayerNorm(self.d_inner)
-        self.out_proj = nn.Linear(
+        self.out_norm = torch.nn.LayerNorm(self.d_inner)
+        self.out_proj = torch.nn.Linear(
             self.d_inner, self.d_model, bias=bias, **factory_kwargs
         )
-        self.dropout = nn.Dropout(dropout) if dropout > 0.0 else None
+        self.dropout = torch.nn.Dropout(dropout) if dropout > 0.0 else None
 
     @staticmethod
     def dt_init(
@@ -434,14 +444,14 @@ class SS2D(nn.Module):
         dt_init_floor=1e-4,
         **factory_kwargs,
     ):
-        dt_proj = nn.Linear(dt_rank, d_inner, bias=True, **factory_kwargs)
+        dt_proj = torch.nn.Linear(dt_rank, d_inner, bias=True, **factory_kwargs)
 
         # Initialize special dt projection to preserve variance at initialization
         dt_init_std = dt_rank**-0.5 * dt_scale
         if dt_init == "constant":
-            nn.init.constant_(dt_proj.weight, dt_init_std)
+            torch.nn.init.constant_(dt_proj.weight, dt_init_std)
         elif dt_init == "random":
-            nn.init.uniform_(dt_proj.weight, -dt_init_std, dt_init_std)
+            torch.nn.init.uniform_(dt_proj.weight, -dt_init_std, dt_init_std)
         else:
             raise NotImplementedError
 
@@ -473,7 +483,7 @@ class SS2D(nn.Module):
             A_log = repeat(A_log, "d n -> r d n", r=copies)
             if merge:
                 A_log = A_log.flatten(0, 1)
-        A_log = nn.Parameter(A_log)
+        A_log = torch.nn.Parameter(A_log)
         A_log._no_weight_decay = True
         return A_log
 
@@ -485,14 +495,14 @@ class SS2D(nn.Module):
             D = repeat(D, "n1 -> r n1", r=copies)
             if merge:
                 D = D.flatten(0, 1)
-        D = nn.Parameter(D)  # Keep in fp32
+        D = torch.nn.Parameter(D)  # Keep in fp32
         D._no_weight_decay = True
         return D
 
     def forward_corev0(self, x: torch.Tensor):
         self.selective_scan = selective_scan_fn
 
-        B, C, H, W = x.shape
+        B, _, H, W = x.shape
         L = H * W
         K = 4
 
@@ -557,7 +567,7 @@ class SS2D(nn.Module):
     def forward_corev1(self, x: torch.Tensor):
         self.selective_scan = selective_scan_fn_v1
 
-        B, C, H, W = x.shape
+        B, _, H, W = x.shape
         L = H * W
         K = 4
 
@@ -617,7 +627,7 @@ class SS2D(nn.Module):
         return out_y[:, 0], inv_y[:, 0], wh_y, invwh_y
 
     def forward(self, x: torch.Tensor, **kwargs):
-        B, H, W, C = x.shape
+        B, H, W, _ = x.shape
 
         xz = self.in_proj(x)
         x, z = xz.chunk(2, dim=-1)  # (b, h, w, d)
@@ -652,12 +662,14 @@ def channel_shuffle(x: Tensor, groups: int) -> Tensor:
     return x
 
 
-class SS_Conv_SSM(nn.Module):
+class SS_Conv_SSM(torch.nn.Module):
     def __init__(
         self,
         hidden_dim: int = 0,
         drop_path: float = 0,
-        norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+        norm_layer: Callable[..., torch.nn.Module] = partial(
+            torch.nn.LayerNorm, eps=1e-6
+        ),
         attn_drop_rate: float = 0,
         d_state: int = 16,
         **kwargs,
@@ -669,35 +681,35 @@ class SS_Conv_SSM(nn.Module):
         )
         self.drop_path = DropPath(drop_path)
 
-        self.conv33conv33conv11 = nn.Sequential(
-            nn.BatchNorm2d(hidden_dim // 2),
-            nn.Conv2d(
+        self.conv33conv33conv11 = torch.nn.Sequential(
+            torch.nn.BatchNorm2d(hidden_dim // 2),
+            torch.nn.Conv2d(
                 in_channels=hidden_dim // 2,
                 out_channels=hidden_dim // 2,
                 kernel_size=3,
                 stride=1,
                 padding=1,
             ),
-            nn.BatchNorm2d(hidden_dim // 2),
-            nn.ReLU(),
-            nn.Conv2d(
+            torch.nn.BatchNorm2d(hidden_dim // 2),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(
                 in_channels=hidden_dim // 2,
                 out_channels=hidden_dim // 2,
                 kernel_size=3,
                 stride=1,
                 padding=1,
             ),
-            nn.BatchNorm2d(hidden_dim // 2),
-            nn.ReLU(),
-            nn.Conv2d(
+            torch.nn.BatchNorm2d(hidden_dim // 2),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(
                 in_channels=hidden_dim // 2,
                 out_channels=hidden_dim // 2,
                 kernel_size=1,
                 stride=1,
             ),
-            nn.ReLU(),
+            torch.nn.ReLU(),
         )
-        # self.finalconv11 = nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=1, stride=1)
+        # self.finalconv11 = torch.nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=1, stride=1)
 
     def forward(self, input: torch.Tensor):
         input_left, input_right = input.chunk(2, dim=-1)
@@ -710,7 +722,7 @@ class SS_Conv_SSM(nn.Module):
         return output + input
 
 
-class VSSLayer(nn.Module):
+class VSSLayer(torch.nn.Module):
     """A basic Swin Transformer layer for one stage.
     Args:
         dim (int): Number of input channels.
@@ -718,8 +730,8 @@ class VSSLayer(nn.Module):
         drop (float, optional): Dropout rate. Default: 0.0
         attn_drop (float, optional): Attention dropout rate. Default: 0.0
         drop_path (float | tuple[float], optional): Stochastic depth rate. Default: 0.0
-        norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
-        downsample (nn.Module | None, optional): Downsample layer at the end of the layer. Default: None
+        norm_layer (torch.nn.Module, optional): Normalization layer. Default: torch.nn.LayerNorm
+        downsample (torch.nn.Module | None, optional): Downsample layer at the end of the layer. Default: None
         use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
     """
 
@@ -729,7 +741,7 @@ class VSSLayer(nn.Module):
         depth,
         attn_drop=0.0,
         drop_path=0.0,
-        norm_layer=nn.LayerNorm,
+        norm_layer=torch.nn.LayerNorm,
         downsample=None,
         use_checkpoint=False,
         d_state=16,
@@ -739,7 +751,7 @@ class VSSLayer(nn.Module):
         self.dim = dim
         self.use_checkpoint = use_checkpoint
 
-        self.blocks = nn.ModuleList([
+        self.blocks = torch.nn.ModuleList([
             SS_Conv_SSM(
                 hidden_dim=dim,
                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
@@ -752,11 +764,11 @@ class VSSLayer(nn.Module):
 
         if True:  # is this really applied? Yes, but been overriden later in VSSM!
 
-            def _init_weights(module: nn.Module):
+            def _init_weights(module: torch.nn.Module):
                 for name, p in module.named_parameters():
                     if name in ["out_proj.weight"]:
                         p = p.clone().detach_()  # fake init, just to keep the seed ....
-                        nn.init.kaiming_uniform_(p, a=math.sqrt(5))
+                        torch.nn.init.kaiming_uniform_(p, a=math.sqrt(5))
 
             self.apply(_init_weights)
 
@@ -778,7 +790,7 @@ class VSSLayer(nn.Module):
         return x
 
 
-class VSSLayer_up(nn.Module):
+class VSSLayer_up(torch.nn.Module):
     """A basic Swin Transformer layer for one stage.
     Args:
         dim (int): Number of input channels.
@@ -786,8 +798,8 @@ class VSSLayer_up(nn.Module):
         drop (float, optional): Dropout rate. Default: 0.0
         attn_drop (float, optional): Attention dropout rate. Default: 0.0
         drop_path (float | tuple[float], optional): Stochastic depth rate. Default: 0.0
-        norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
-        downsample (nn.Module | None, optional): Downsample layer at the end of the layer. Default: None
+        norm_layer (torch.nn.Module, optional): Normalization layer. Default: torch.nn.LayerNorm
+        downsample (torch.nn.Module | None, optional): Downsample layer at the end of the layer. Default: None
         use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
     """
 
@@ -797,7 +809,7 @@ class VSSLayer_up(nn.Module):
         depth,
         attn_drop=0.0,
         drop_path=0.0,
-        norm_layer=nn.LayerNorm,
+        norm_layer=torch.nn.LayerNorm,
         upsample=None,
         use_checkpoint=False,
         d_state=16,
@@ -807,7 +819,7 @@ class VSSLayer_up(nn.Module):
         self.dim = dim
         self.use_checkpoint = use_checkpoint
 
-        self.blocks = nn.ModuleList([
+        self.blocks = torch.nn.ModuleList([
             SS_Conv_SSM(
                 hidden_dim=dim,
                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
@@ -820,11 +832,11 @@ class VSSLayer_up(nn.Module):
 
         if True:  # is this really applied? Yes, but been overriden later in VSSM!
 
-            def _init_weights(module: nn.Module):
+            def _init_weights(module: torch.nn.Module):
                 for name, p in module.named_parameters():
                     if name in ["out_proj.weight"]:
                         p = p.clone().detach_()  # fake init, just to keep the seed ....
-                        nn.init.kaiming_uniform_(p, a=math.sqrt(5))
+                        torch.nn.init.kaiming_uniform_(p, a=math.sqrt(5))
 
             self.apply(_init_weights)
 
@@ -844,7 +856,7 @@ class VSSLayer_up(nn.Module):
         return x
 
 
-class VSSM(nn.Module):
+class VSSM(torch.nn.Module):
     def __init__(
         self,
         patch_size=4,
@@ -858,7 +870,7 @@ class VSSM(nn.Module):
         drop_rate=0.0,
         attn_drop_rate=0.0,
         drop_path_rate=0.1,
-        norm_layer=nn.LayerNorm,
+        norm_layer=torch.nn.LayerNorm,
         patch_norm=True,
         use_checkpoint=False,
         **kwargs,
@@ -885,11 +897,11 @@ class VSSM(nn.Module):
         # drop_rate = 0.0
         if self.ape:
             self.patches_resolution = self.patch_embed.patches_resolution
-            self.absolute_pos_embed = nn.Parameter(
+            self.absolute_pos_embed = torch.nn.Parameter(
                 torch.zeros(1, *self.patches_resolution, self.embed_dim)
             )
             trunc_normal_(self.absolute_pos_embed, std=0.02)
-        self.pos_drop = nn.Dropout(p=drop_rate)
+        self.pos_drop = torch.nn.Dropout(p=drop_rate)
 
         dpr = [
             x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))
@@ -898,7 +910,7 @@ class VSSM(nn.Module):
             x.item() for x in torch.linspace(0, drop_path_rate, sum(depths_decoder))
         ][::-1]
 
-        self.layers = nn.ModuleList()
+        self.layers = torch.nn.ModuleList()
         for i_layer in range(self.num_layers):
             layer = VSSLayer(
                 dim=dims[i_layer],
@@ -916,34 +928,36 @@ class VSSM(nn.Module):
             self.layers.append(layer)
 
         # self.norm = norm_layer(self.num_features)
-        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.avgpool = torch.nn.AdaptiveAvgPool2d(1)
         self.head = (
-            nn.Linear(self.num_features, num_classes)
+            torch.nn.Linear(self.num_features, num_classes)
             if num_classes > 0
-            else nn.Identity()
+            else torch.nn.Identity()
         )
 
         self.apply(self._init_weights)
         for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            if isinstance(m, torch.nn.Conv2d):
+                torch.nn.init.kaiming_normal_(
+                    m.weight, mode="fan_out", nonlinearity="relu"
+                )
 
-    def _init_weights(self, m: nn.Module):
+    def _init_weights(self, m: torch.nn.Module):
         """
-        out_proj.weight which is previously initilized in SS_Conv_SSM, would be cleared in nn.Linear
+        out_proj.weight which is previously initilized in SS_Conv_SSM, would be cleared in torch.nn.Linear
         no fc.weight found in the any of the model parameters
-        no nn.Embedding found in the any of the model parameters
+        no torch.nn.Embedding found in the any of the model parameters
         so the thing is, SS_Conv_SSM initialization is useless
 
         Conv2D is not intialized !!!
         """
-        if isinstance(m, nn.Linear):
+        if isinstance(m, torch.nn.Linear):
             trunc_normal_(m.weight, std=0.02)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
+            if isinstance(m, torch.nn.Linear) and m.bias is not None:
+                torch.nn.init.constant_(m.bias, 0)
+        elif isinstance(m, torch.nn.LayerNorm):
+            torch.nn.init.constant_(m.bias, 0)
+            torch.nn.init.constant_(m.weight, 1.0)
 
     @torch.jit.ignore
     def no_weight_decay(self):
@@ -1182,15 +1196,21 @@ class ClipClassifier(torch.nn.Module):
         return predicted_class, probabilities
 
 
-def init_model(model, tokenizer=None, aug_cfg: Optional[Dict[str, Any]] = None):
+def init_model(
+    model, tokenizer=None, aug_cfg: Optional[Dict[str, Any]] = None, is_clip=False
+):
     # device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    medmamba_b = VSSM(depths=[2, 2, 12, 2], dims=[128, 256, 512, 1024], num_classes=2)
-    if isinstance(model, str):
+    if model == "medmamba":
+        model = VSSM(depths=[2, 2, 8, 2], dims=[64, 128, 256, 512], num_classes=2)
+    elif isinstance(model, str):
         tokenizer = tokenizer or model
         model, _ = create_model_from_pretrained(f"hf-hub:{model}")
     elif callable(model):
         model = model()
+
+    if is_clip:
+        model = ClipModel(model)
 
     if isinstance(tokenizer, str):
         tokenizer = get_tokenizer(f"hf-hub:{tokenizer}")
@@ -1203,4 +1223,4 @@ def init_model(model, tokenizer=None, aug_cfg: Optional[Dict[str, Any]] = None):
 
     preprocess_train = get_transform(aug_cfg, pp_cfg, is_train=True)
     preprocess_val = get_transform(aug_cfg, pp_cfg, is_train=False)
-    return ClipModel(model), preprocess_train, preprocess_val, tokenizer
+    return model, preprocess_train, preprocess_val, tokenizer
