@@ -35,7 +35,7 @@ setup(
     ],
     entry_points={
         "console_scripts": [
-            "isic = isic.cli:main",
+            "isic = isic.cli.main:main",
         ],
     },
 )
