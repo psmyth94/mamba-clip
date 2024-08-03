@@ -17,7 +17,6 @@
 import functools
 import logging
 import os
-from pathlib import Path
 import sys
 import threading
 import warnings
@@ -33,6 +32,7 @@ from logging import (
     WARNING,  # NOQA
 )
 from logging import captureWarnings as _captureWarnings
+from pathlib import Path
 from typing import Optional
 
 from tqdm import auto as tqdm_lib
@@ -438,13 +438,14 @@ def unsilence(verbosity, is_pb_enabled):
 
 # output the log to a text file
 def logger_setup(output_dir=None, log_file=None):
+    set_verbosity_info()
     if log_file is not None:
         if isinstance(log_file, bool) and log_file:
             log_file = f"{datetime.datetime.now().strftime('%y-%m-%d_%h-%m-%s')}.err"
         if not log_file.endswith(".err"):
             log_file = Path(log_file).with_suffix(".err").name
         log_file = os.path.join(output_dir, log_file)
-        handler = logging.logging.StreamHandler()
+        handler = logging.StreamHandler()
         sys.stderr = open(log_file, "w")
         handler.flush = sys.stderr.flush
         handler.propagate = False
@@ -460,9 +461,9 @@ def logger_setup(output_dir=None, log_file=None):
             f"%(log_color)s{header}%(reset)s {message}",
         )
     else:
-        fh = logging.logging.Formatter(f"{header} {message}")
-    logging.set_formatter(fh)
-    logging.enable_propagation()
+        fh = logging.Formatter(f"{header} {message}")
+    set_formatter(fh)
+    enable_propagation()
 
 
 def _color_supported() -> bool:

@@ -5,6 +5,7 @@ from typing import List, Optional, Type, Union
 
 from isic.model import ClipClassifier
 from isic.pipeline import pipeline
+from isic.utils.logging import logger_setup
 
 
 @dataclass
@@ -434,6 +435,7 @@ def arg_parser() -> Args:
     return Args(**vars(args))
 
 def main():
+    logger_setup()
     args = arg_parser()
     args.stage = 1
     args.model_stage_1 = "medmamba"
