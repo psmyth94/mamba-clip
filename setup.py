@@ -33,4 +33,9 @@ setup(
         "https://pytorch.org/get-started/locally/",
         "https://developer.nvidia.com/nccl",
     ],
+    entry_points={
+        "console_scripts": [
+            "isic = isic.cli:main",
+        ],
+    },
 )
