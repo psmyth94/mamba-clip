@@ -433,12 +433,14 @@ def arg_parser() -> Args:
     args = parser.parse_args()
     return Args(**vars(args))
 
-
-# %%
-if __name__ == "__main__":
+def main():
     args = arg_parser()
     args.stage = 1
     args.model_stage_1 = "medmamba"
     args.small_test = True
     pipeline(args)
+
+# %%
+if __name__ == "__main__":
+    main()
     # %%
