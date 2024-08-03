@@ -1,3 +1,133 @@
 wandb/
 data/
 logs/
+*.lock
+docs
+_dev
+# Ignore Nextflow-related files and directories
+.nextflow*
+work
+_dev/in_progress*
+.dev
+
+# Ignore data directory
+tests/data
+
+# anything not ipynb related
+tutorials/*
+!tutorials/*.ipynb
+
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.conda
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+cache*.arrow
+cache*.yaml
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+-checkpoint.ipynb
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+# According to https://pipenv.pypa.io/en/latest/advanced/#pipfile-vs-pipfilelock
+# PIPENV_VENV_IN_PROJECT=1
+Pipfile.lock
+
+# Poetry
+# https://python-poetry.org/docs/basic-usage/#configuring-poetry
+.poetry/
+
+# virtualenv
+venv/
+env/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# Idea project settings
+.idea/
+
+# PyCharm project settings
+.idea/
+
+# Visual Studio Code settings
+.vscode/
+.vs/
+
+# MyPy
+.mypy_cache/
+
+# pycodestyle
+.pytest_cache/
+
+
