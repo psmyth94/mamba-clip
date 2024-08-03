@@ -425,7 +425,6 @@ def pipeline(args):
 
             if (
                 any(v in data for v in ("val", "imagenet-val", "imagenet-v2"))
-                and args.stage > 1
             ):
                 evaluate(
                     model,
