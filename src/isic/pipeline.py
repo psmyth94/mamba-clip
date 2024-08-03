@@ -423,9 +423,7 @@ def pipeline(args):
             )
             completed_epoch = epoch + 1
 
-            if (
-                any(v in data for v in ("val", "imagenet-val", "imagenet-v2"))
-            ):
+            if any(v in data for v in ("val", "imagenet-val", "imagenet-v2")):
                 evaluate(
                     model,
                     data,
