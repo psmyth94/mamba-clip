@@ -2,7 +2,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="isic",
-    version="0.0.0",
+    version="0.1.0",
     description="International Skin Imaging Collaboration (ISIC) 2024 Challenge",
     author_email="psmyth1994@gmail.com",
     license="Apache 2.0",
