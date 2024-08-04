@@ -4,23 +4,23 @@
 
 Mamba-Clip provides a comprehensive training pipeline for a machine learning model using PyTorch. It automatically detects if multiple GPUs are used and adjusts accordingly. The code includes functions for data loading, model definition, training, evaluation, and various utilities for distributed training, logging, and saving checkpoints.
 
-## Prerequisites
+## Installation
 
-Ensure you have the following libraries installed:
-- Python 3.7+
-- open-clip
-- mamba-ssm
-- PyTorch
-- torchvision
-- pandas
-- h5py
-- numpy
-- fsspec
-- sklearn
-- PIL
-- tqdm
-- transformers
-- wandb (optional for logging)
+To install Mamba-Clip, create a new conda environment and install the required packages:
+```sh
+conda create -n mamba-clip python=3.11
+conda install \
+    cuda-toolkit \
+    cuda-compiler \
+    pytorch \
+    torchvision \
+    torchaudio \
+    cudatoolkit=11.8 \
+    -c pytorch \
+    -c nvidia/label/cuda-11.8.0
+pip install mamba-clip
+```
+Note that we install cuda-* for CUDA awareness.
 
 ## Usage
 
@@ -45,11 +45,41 @@ mamba-clip --data-path <path_to_data> --logs ./logs/ --batch-size 64 --epochs 10
 - `--model-stage-2`: Model for stage 2.
 - `--tokenizer`: Tokenizer to use.
 
+For a full list of command line arguments, run `mamba-clip --help`.
+
 ### Example
 
-Example command to run the training script:
+Download the ISIC 2024 Challenge dataset from
+[Kaggle](https://www.kaggle.com/c/siim-isic-melanoma-classification/data) and extract
+the contents to a directory by running:
 
 ```sh
+python download_dataset.py
+```
+
+Then, run the following command to train the model:
+
+```sh
+mamba-clip --data-path ./data/isic-2024-challenge/ --logs ./logs/ --batch-size 64 --epochs 10 --lr 1e-4 --precision amp --model-stage-1 microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224 --model-stage-2 ClipClassifier --tokenizer hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224
+```
+
+If running on SLURM, you can use the following command:
+
+```sh
+#!/bin/bash
+#SBATCH --job-name=mamba-clip
+#SBATCH --output=logs/%j.out
+#SBATCH --error=logs/%j.err
+#SBATCH --partition=debug
+#SBATCH --nodes=1
+#SBATCH --ntasks=2
+#SBATCH --cpus-per-task=4
+#SBATCH --gres=gpu:2
+
+module load cuda/11.8
+source .bashrc
+conda activate mamba-clip
+
 mamba-clip --data-path ./data/isic-2024-challenge/ --logs ./logs/ --batch-size 64 --epochs 10 --lr 1e-4 --precision amp --model-stage-1 microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224 --model-stage-2 ClipClassifier --tokenizer hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224
 ```
 

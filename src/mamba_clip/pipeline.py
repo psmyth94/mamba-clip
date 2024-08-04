@@ -9,7 +9,7 @@ import torch.distributed as dist
 from open_clip import trace_model
 from open_clip_train.scheduler import const_lr, const_lr_cooldown, cosine_lr
 from torch import optim
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 
 from mamba_clip.data import ComboLoader, get_combo_loader, get_data, modify_loader
 from mamba_clip.eval import evaluate
@@ -281,7 +281,8 @@ def pipeline(args):
                 betas=(args.beta1, args.beta2),
                 eps=args.eps,
             )
-            scaler = GradScaler() if args.precision == "amp" else None
+            scaler_device_type = "cuda" if "cuda" in device.type else "cpu"
+            scaler = GradScaler(scaler_device_type) if args.precision == "amp" else None
 
         # optionally resume from a checkpoint
         start_epoch = 0
