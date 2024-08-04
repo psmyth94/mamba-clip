@@ -1,9 +1,9 @@
 from setuptools import find_packages, setup
 
 setup(
-    name="isic",
+    name="mamba-clip",
     version="0.1.0",
-    description="International Skin Imaging Collaboration (ISIC) 2024 Challenge",
+    description="A package for training mamba vision model and text encoder using CLIP",
     author_email="psmyth1994@gmail.com",
     license="Apache 2.0",
     package_dir={"": "src"},
@@ -35,7 +35,7 @@ setup(
     ],
     entry_points={
         "console_scripts": [
-            "isic = isic.cli.main:main",
+            "mamba-clip = mamba_clip.cli.main:main",
         ],
     },
 )
