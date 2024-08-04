@@ -50,7 +50,7 @@ For a full list of command line arguments, run `mamba-clip --help`.
 ### Example
 
 Download the ISIC 2024 Challenge dataset from
-[Kaggle](https://www.kaggle.com/c/siim-isic-melanoma-classification/data) and extract
+[Kaggle](https://www.kaggle.com/c/isic-2024-challenge/data) and extract
 the contents to a directory by running:
 
 ```sh
