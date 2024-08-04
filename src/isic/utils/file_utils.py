@@ -80,6 +80,26 @@ def start_sync_process(
     )
 
 
+def load_checkpoint(args, checkpoint, model, optimizer=None, scaler=None):
+    if "epoch" in checkpoint:
+        # resuming a train checkpoint w/ epoch and optimizer state
+        start_epoch = checkpoint["epoch"]
+        sd = checkpoint["state_dict"]
+        if not args.distributed and next(iter(sd.items()))[0].startswith("module"):
+            sd = {k[len("module.") :]: v for k, v in sd.items()}
+        model.load_state_dict(sd, strict=False)
+        if optimizer is not None:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        if scaler is not None and "scaler" in checkpoint:
+            scaler.load_state_dict(checkpoint["scaler"])
+        logger.info(f"=> resuming checkpoint '{args.resume}' (epoch {start_epoch})")
+    else:
+        # loading a bare (model only) checkpoint for fine-tune or evaluation
+        model.load_state_dict(checkpoint)
+        logger.info(f"=> loaded checkpoint '{args.resume}' (epoch {start_epoch})")
+    return model, optimizer, scaler, start_epoch
+
+
 def remote_sync(local_dir: str, remote_dir: str, protocol: str) -> bool:
     """
     Sync the local directory with the remote directory using fsspec.

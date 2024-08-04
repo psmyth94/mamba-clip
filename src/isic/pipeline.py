@@ -6,10 +6,7 @@ from functools import partial
 import numpy as np
 import torch
 import torch.distributed as dist
-from open_clip import (
-    load_checkpoint,
-    trace_model,
-)
+from open_clip import trace_model
 from open_clip_train.scheduler import const_lr, const_lr_cooldown, cosine_lr
 from torch import optim
 from torch.cuda.amp import GradScaler
@@ -20,7 +17,12 @@ from isic.loss import ClipLoss, cross_entropy_loss
 from isic.model import ClipClassifier, init_model
 from isic.train import LATEST_CHECKPOINT_NAME, train_one_epoch
 from isic.utils.dist_utils import broadcast_object, init_device, is_master
-from isic.utils.file_utils import pt_load, remote_sync, start_sync_process
+from isic.utils.file_utils import (
+    load_checkpoint,
+    pt_load,
+    remote_sync,
+    start_sync_process,
+)
 from isic.utils.generic_utils import get_latest_checkpoint, random_seed
 from isic.utils.logging import create_log_path, get_logger
 
@@ -476,7 +478,7 @@ def pipeline(args):
 
     if args.stage == 1:
         model_stage_1, preprocess_train, preprocess_val, tokenizer = init_model(
-            args.model_stage_1
+            args.model_stage_1, use_tokenizer=not args.use_visual_only
         )
         data = get_data(args, preprocess_train, preprocess_val, tokenizer)
         model_stage_1.to(device)

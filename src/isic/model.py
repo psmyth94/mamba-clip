@@ -1197,7 +1197,11 @@ class ClipClassifier(torch.nn.Module):
 
 
 def init_model(
-    model, tokenizer=None, aug_cfg: Optional[Dict[str, Any]] = None, is_clip=False
+    model,
+    tokenizer=None,
+    aug_cfg: Optional[Dict[str, Any]] = None,
+    is_clip=False,
+    use_tokenizer=False,
 ):
     # device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -1212,10 +1216,11 @@ def init_model(
     if is_clip:
         model = ClipModel(model)
 
-    if isinstance(tokenizer, str):
-        tokenizer = get_tokenizer(f"hf-hub:{tokenizer}")
-    elif callable(tokenizer):
-        tokenizer = tokenizer()
+    if use_tokenizer:
+        if isinstance(tokenizer, str):
+            tokenizer = get_tokenizer(f"hf-hub:{tokenizer}")
+        elif callable(tokenizer):
+            tokenizer = tokenizer()
 
     pp_cfg = None
     if hasattr(model, "visual") and hasattr(model.visual, "preprocess_cfg"):
