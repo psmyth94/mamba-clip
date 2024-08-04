@@ -80,7 +80,7 @@ class Args:
     dist_backend: str = "nccl"
     report_to: str = ""
     wandb_notes: str = ""
-    wandb_project_name: str = "open-clip"
+    wandb_project_name: str = "mamba-clip"
     debug: bool = False
     copy_codebase: bool = False
     ddp_static_graph: bool = False
