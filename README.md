@@ -1,13 +1,15 @@
-# Project README
+# Mamba-Clip README
 
 ## Overview
 
-This project provides a comprehensive training pipeline for a machine learning model using PyTorch, including data loading, model definition, training, evaluation, and various utilities for distributed training, logging, and saving checkpoints.
+Mamba-Clip provides a comprehensive training pipeline for a machine learning model using PyTorch. It automatically detects if multiple GPUs are used and adjusts accordingly. The code includes functions for data loading, model definition, training, evaluation, and various utilities for distributed training, logging, and saving checkpoints.
 
 ## Prerequisites
 
 Ensure you have the following libraries installed:
 - Python 3.7+
+- open-clip
+- mamba-ssm
 - PyTorch
 - torchvision
 - pandas
@@ -27,7 +29,7 @@ Ensure you have the following libraries installed:
 To run the training script:
 
 ```sh
-python main.py --data-path <path_to_data> --logs ./logs/ --batch-size 64 --epochs 10
+mamba-clip --data-path <path_to_data> --logs ./logs/ --batch-size 64 --epochs 10
 ```
 
 ### Key Command Line Arguments
@@ -38,7 +40,6 @@ python main.py --data-path <path_to_data> --logs ./logs/ --batch-size 64 --epoch
 - `--epochs`: Number of epochs to train.
 - `--lr`: Learning rate for the optimizer.
 - `--precision`: Precision for training (e.g., "amp" for automatic mixed precision).
-- `--distributed`: Enable distributed training.
 - `--resume`: Path to resume checkpoint.
 - `--model-stage-1`: Model for stage 1.
 - `--model-stage-2`: Model for stage 2.
@@ -49,7 +50,7 @@ python main.py --data-path <path_to_data> --logs ./logs/ --batch-size 64 --epoch
 Example command to run the training script:
 
 ```sh
-python main.py --data-path ./data/isic-2024-challenge/ --logs ./logs/ --batch-size 64 --epochs 10 --lr 1e-4 --precision amp --model-stage-1 microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224 --model-stage-2 ClipClassifier --tokenizer hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224 --distributed
+mamba-clip --data-path ./data/isic-2024-challenge/ --logs ./logs/ --batch-size 64 --epochs 10 --lr 1e-4 --precision amp --model-stage-1 microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224 --model-stage-2 ClipClassifier --tokenizer hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224
 ```
 
 ## Contributing
@@ -67,7 +68,3 @@ This project is licensed under the MIT License. See the `LICENSE` file for detai
 ## Contact
 
 For questions or issues, open an issue in the repository or contact the project maintainers.
-
----
-
-This README provides an overview, instructions for usage, and guidelines for contributing. For detailed information on specific functions and classes, refer to the inline comments and docstrings in the code.
