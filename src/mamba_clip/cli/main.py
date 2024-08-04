@@ -39,6 +39,7 @@ class Args:
     use_bn_sync: bool = False
     skip_scheduler: bool = False
     lr_scheduler: str = "cosine"
+    lr_restart_interval: Optional[int] = None
     lr_cooldown_end: float = 0.0
     lr_cooldown_power: float = 1.0
     save_frequency: int = 1
@@ -204,6 +205,11 @@ def arg_parser() -> Args:
         type=str,
         default="cosine",
         help="Learning rate scheduler type",
+    )
+    parser.add_argument(
+        "--lr-restart-interval",
+        type=int,
+        help="Number of steps before restarting the learning rate scheduler",
     )
     parser.add_argument(
         "--lr-cooldown-end",

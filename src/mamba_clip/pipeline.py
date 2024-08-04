@@ -7,7 +7,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from open_clip import trace_model
-from open_clip_train.scheduler import const_lr, const_lr_cooldown, cosine_lr
 from torch import optim
 from torch.amp import GradScaler
 
@@ -15,6 +14,7 @@ from mamba_clip.data import ComboLoader, get_combo_loader, get_data, modify_load
 from mamba_clip.eval import evaluate
 from mamba_clip.loss import ClipLoss, cross_entropy_loss
 from mamba_clip.model import ClipClassifier, init_model
+from mamba_clip.scheduler import const_lr, const_lr_cooldown, cosine_lr
 from mamba_clip.train import LATEST_CHECKPOINT_NAME, train_one_epoch
 from mamba_clip.utils.dist_utils import broadcast_object, init_device, is_master
 from mamba_clip.utils.file_utils import (
@@ -301,10 +301,23 @@ def pipeline(args):
             total_steps = (
                 data["train"].dataloader.num_batches // args.accum_freq
             ) * args.epochs
+
             if args.lr_scheduler == "cosine":
-                scheduler = cosine_lr(optimizer, args.lr, args.warmup, total_steps)
+                scheduler = cosine_lr(
+                    optimizer,
+                    args.lr,
+                    args.warmup,
+                    total_steps,
+                    restart_interval=args.lr_restart_interval,
+                )
             elif args.lr_scheduler == "const":
-                scheduler = const_lr(optimizer, args.lr, args.warmup, total_steps)
+                scheduler = const_lr(
+                    optimizer,
+                    args.lr,
+                    args.warmup,
+                    total_steps,
+                    restart_interval=args.lr_restart_interval,
+                )
             elif args.lr_scheduler == "const-cooldown":
                 assert (
                     args.epochs_cooldown is not None
@@ -320,6 +333,7 @@ def pipeline(args):
                     cooldown_steps,
                     args.lr_cooldown_power,
                     args.lr_cooldown_end,
+                    restart_interval=args.lr_restart_interval,
                 )
             else:
                 logger.error(
