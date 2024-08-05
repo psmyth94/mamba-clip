@@ -307,11 +307,16 @@ def pipeline(args):
                 restart_interval_steps = (
                     data["train"].dataloader.num_batches // args.accum_freq
                 ) * args.lr_restart_interval
+            warmup_steps = None
+            if args.warmup is not None:
+                warmup_steps = (
+                    data["train"].dataloader.num_batches // args.accum_freq
+                ) * args.warmup
             if args.lr_scheduler == "cosine":
                 scheduler = cosine_lr(
                     optimizer,
                     args.lr,
-                    args.warmup,
+                    warmup_steps,
                     total_steps,
                     restart_interval=restart_interval_steps,
                 )
@@ -319,7 +324,7 @@ def pipeline(args):
                 scheduler = const_lr(
                     optimizer,
                     args.lr,
-                    args.warmup,
+                    warmup_steps,
                     total_steps,
                     restart_interval=restart_interval_steps,
                 )
@@ -333,7 +338,7 @@ def pipeline(args):
                 scheduler = const_lr_cooldown(
                     optimizer,
                     args.lr,
-                    args.warmup,
+                    warmup_steps,
                     total_steps,
                     cooldown_steps,
                     args.lr_cooldown_power,

@@ -189,7 +189,7 @@ def arg_parser() -> Args:
     parser.add_argument(
         "--warmup",
         type=int,
-        default=10000,
+        default=1,
         help="Warmup steps for learning rate scheduler",
     )
     parser.add_argument(
