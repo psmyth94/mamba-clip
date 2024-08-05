@@ -309,7 +309,7 @@ def pipeline(args):
                 ) * args.lr_restart_interval
             warmup_steps = None
             if args.warmup is not None:
-                warmup_steps = (
+                warmup_steps = int(
                     data["train"].dataloader.num_batches // args.accum_freq
                 ) * args.warmup
             if args.lr_scheduler == "cosine":
