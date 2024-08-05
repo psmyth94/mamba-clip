@@ -188,7 +188,7 @@ def arg_parser() -> Args:
     parser.add_argument("--wd", type=float, default=0.05, help="Weight decay")
     parser.add_argument(
         "--warmup",
-        type=int,
+        type=float,
         default=1,
         help="Warmup steps for learning rate scheduler",
     )
