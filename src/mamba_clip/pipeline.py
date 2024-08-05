@@ -302,13 +302,18 @@ def pipeline(args):
                 data["train"].dataloader.num_batches // args.accum_freq
             ) * args.epochs
 
+            restart_interval_steps = None
+            if args.lr_restart_interval is not None:
+                restart_interval_steps = (
+                    data["train"].dataloader.num_batches // args.accum_freq
+                ) * args.lr_restart_interval
             if args.lr_scheduler == "cosine":
                 scheduler = cosine_lr(
                     optimizer,
                     args.lr,
                     args.warmup,
                     total_steps,
-                    restart_interval=args.lr_restart_interval,
+                    restart_interval=restart_interval_steps,
                 )
             elif args.lr_scheduler == "const":
                 scheduler = const_lr(
@@ -316,7 +321,7 @@ def pipeline(args):
                     args.lr,
                     args.warmup,
                     total_steps,
-                    restart_interval=args.lr_restart_interval,
+                    restart_interval=restart_interval_steps,
                 )
             elif args.lr_scheduler == "const-cooldown":
                 assert (
@@ -333,7 +338,7 @@ def pipeline(args):
                     cooldown_steps,
                     args.lr_cooldown_power,
                     args.lr_cooldown_end,
-                    restart_interval=args.lr_restart_interval,
+                    restart_interval=restart_interval_steps,
                 )
             else:
                 logger.error(

@@ -1,3 +1,8 @@
+# This module is an adaptation of amp utils from Open-CLIP
+# Source: https://github.com/mlfoundations/open-clip
+# Adapted by: Patrick Smyth
+# Date: 2024-08-04
+# Modifications include removal deprecated functions and renaming of functions
 from contextlib import suppress
 from typing import Callable, Optional, Union
 
