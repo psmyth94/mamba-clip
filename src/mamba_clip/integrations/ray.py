@@ -6,15 +6,9 @@ from pathlib import Path
 from typing import Any
 
 import optuna
-import ray
 import torch
-from ray import tune
-from ray.air import CheckpointConfig, RunConfig
-from ray.air.integrations.wandb import WandbLoggerCallback
-from ray.tune.schedulers import ASHAScheduler
-from ray.tune.search.optuna import OptunaSearch
-from ray.util.joblib import register_ray
 
+import ray
 from mamba_clip.data import get_data
 from mamba_clip.loss import ClipLoss, cross_entropy_loss
 from mamba_clip.model import ClipClassifier, init_model
@@ -29,6 +23,12 @@ from mamba_clip.utils.file_utils import (
     pt_load,
 )
 from mamba_clip.utils.logging import create_log_path, get_logger
+from ray import tune
+from ray.air import CheckpointConfig, RunConfig
+from ray.air.integrations.wandb import WandbLoggerCallback
+from ray.tune.schedulers import ASHAScheduler
+from ray.tune.search.optuna import OptunaSearch
+from ray.util.joblib import register_ray
 
 try:
     import wandb
@@ -177,6 +177,8 @@ class Trainable(tune.Trainable):
 
 def ray_tune_pipeline(args):
     args.local_rank, args.rank, args.world_size = world_info_from_env()
+    # 1 gpu per trial
+    args.distributed = False
     setup_paths(args)
     setup_train(args, checkpoint_prefix=f"stage_{args.stage}_")
     if args.eval_loss is None:
@@ -194,7 +196,7 @@ def ray_tune_pipeline(args):
     #         resume="auto" if args.resume == "latest" else None,
     #         config=vars(args),
     #     )
-    if args.distributed:
+    if "ip_head" in os.environ and "redis_password" in os.environ:
         ip_head = os.environ["ip_head"]
         redis_password = os.environ["redis_password"]
         if is_master(args):
