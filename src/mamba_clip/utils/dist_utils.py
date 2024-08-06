@@ -99,8 +99,8 @@ def broadcast_object(args, obj, src=0):
 
 
 def is_global_master(args):
-    if "MASTER_NODE" in os.environ and "SLURM_NODELIST" in os.environ:
-        return os.environ["MASTER_NODE"] in os.environ["SLURM_NODELIST"]
+    if "HEAD_NODE" in os.environ and "SLURM_NODELIST" in os.environ:
+        return os.environ["HEAD_NODE"] in os.environ["SLURM_NODELIST"]
     return args.rank == 0
 
 
