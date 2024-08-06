@@ -797,9 +797,9 @@ def ray_tune_pipeline(args):
         metric=args.eval_loss,
         mode=mode,
     )
-    if args.resume_from:
-        logger.info(f"Restoring previous state from {args.resume_from}")
-        optuna_search.restore_from_dir(args.resume_from)
+    # if args.resume_from:
+    #     logger.info(f"Restoring previous state from {args.resume_from}")
+    #     optuna_search.restore_from_dir(args.resume_from)
 
     tuner = tune.Tuner(
         tune.with_resources(
