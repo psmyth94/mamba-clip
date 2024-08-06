@@ -3,7 +3,7 @@ import argparse
 from dataclasses import dataclass, field
 from typing import List, Optional, Type, Union
 
-from mamba_clip.pipeline import pipeline, ray_tune_pipeline
+from mamba_clip.pipeline import pipeline
 from mamba_clip.utils.logging import logger_setup
 
 
@@ -473,6 +473,7 @@ def main():
     args.model_stage_1 = "medmamba"
     args.small_test = True
     if args.hyperparameter_tuning:
+        from mamba_clip.pipeline import ray_tune_pipeline
         ray_tune_pipeline(args)
     else:
         pipeline(args)
