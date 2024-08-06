@@ -106,6 +106,11 @@ class Args:
     siglip: bool = False
     small_test: bool = False
 
+    rank: int = 0
+    local_rank: int = 0
+    world_size: int = 1
+
+
 
 def arg_parser():
     parser = argparse.ArgumentParser(description="Argument parser for training script")
