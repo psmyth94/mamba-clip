@@ -6,6 +6,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import optuna
 import ray
 import torch
@@ -99,8 +100,15 @@ class Trainable(tune.Trainable):
                     world_size=args.world_size,
                 )
             else:
-                if args.class_weighted_loss is not None:
-                    loss = partial(cross_entropy_loss, weight=args.class_weighted_loss)
+                if isinstance(
+                    args.class_weighted_loss, (np.ndarray, list, tuple, torch.Tensor)
+                ):
+                    class_weighted_loss = args.class_weighted_loss
+                    if not torch.is_tensor(class_weighted_loss):
+                        class_weighted_loss = torch.tensor(
+                            class_weighted_loss, dtype=torch.float32
+                        ).to(device)
+                    loss = partial(cross_entropy_loss, weight=class_weighted_loss)
                 else:
                     loss = cross_entropy_loss
         elif args.stage == 2:
@@ -138,8 +146,6 @@ class Trainable(tune.Trainable):
                 use_inner_prod=args.use_inner_prod,
             )
             model_stage_2.to(device)
-            setup_paths(args)
-            setup_train(args, checkpoint_prefix=f"stage_{args.stage}_")
             params, args = prepare_params(model_stage_2, data, device, args)
             if not isinstance(args.class_weighted_loss, bool):
                 if not torch.is_tensor(args.class_weighted_loss):
