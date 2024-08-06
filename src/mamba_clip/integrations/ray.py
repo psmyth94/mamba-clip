@@ -7,9 +7,15 @@ from pathlib import Path
 from typing import Any
 
 import optuna
-import torch
-
 import ray
+import torch
+from ray import tune
+from ray.air import CheckpointConfig, RunConfig
+from ray.air.integrations.wandb import WandbLoggerCallback
+from ray.tune.schedulers import ASHAScheduler
+from ray.tune.search.optuna import OptunaSearch
+from ray.util.joblib import register_ray
+
 from mamba_clip.data import get_data
 from mamba_clip.loss import ClipLoss, cross_entropy_loss
 from mamba_clip.model import ClipClassifier, init_model
@@ -24,12 +30,6 @@ from mamba_clip.utils.file_utils import (
     pt_load,
 )
 from mamba_clip.utils.logging import create_log_path, get_logger
-from ray import tune
-from ray.air import CheckpointConfig, RunConfig
-from ray.air.integrations.wandb import WandbLoggerCallback
-from ray.tune.schedulers import ASHAScheduler
-from ray.tune.search.optuna import OptunaSearch
-from ray.util.joblib import register_ray
 
 try:
     import wandb
@@ -52,7 +52,7 @@ def suggest_config(trial: optuna.Trial, args) -> dict[str, Any]:
     args.wd = trial.suggest_float("wd", 1e-4, 1e-1, log=True)
     args.warmup = trial.suggest_float("warmup", 0, 1)
     args.lr_scheduler = trial.suggest_categorical(
-        "lr_scheduler", ["cosine", "const", "const_cooldown"]
+        "lr_scheduler", ["cosine", "const", "const-cooldown"]
     )
     args.lr_restart_interval = trial.suggest_categorical(
         "lr_restart_interval", [1, None]
