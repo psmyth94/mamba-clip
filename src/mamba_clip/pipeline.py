@@ -770,14 +770,26 @@ def ray_tune_pipeline(args):
         mode = "min"
     elif args.eval_loss in ["partial_auc", "auc", "acc"]:
         mode = "max"
+    if wandb is not None:
+        wandb.init(
+            project=args.wandb_project_name,
+            name=args.name,
+            id=args.name,
+            notes=args.wandb_notes,
+            tags=[],
+            resume="auto" if args.resume == "latest" else None,
+            config=vars(args),
+        )
     if is_master(args) and args.distributed:
-        logger.info("ip head: ", os.environ["ip_head"])
-        logger.info("redis pwd: ", os.environ["redis_password"])
-        _node_ip_addr = os.environ["ip_head"].split(":")[0]
-        logger.info("node ip addr: ", _node_ip_addr)
+        ip_head = os.environ["ip_head"]
+        redis_password = os.environ["redis_password"]
+        logger.info(f"ip head: {ip_head}")
+        logger.info(f"redis pwd: {redis_password}")
+        _node_ip_addr = ip_head.split(":")[0]
+        logger.info(f"node ip addr: {_node_ip_addr}")
         ray.init(
-            address=os.environ["ip_head"],
-            _redis_password=os.environ["redis_password"],
+            address=ip_head,
+            _redis_password=redis_password,
             _node_ip_address=_node_ip_addr,
         )
 
