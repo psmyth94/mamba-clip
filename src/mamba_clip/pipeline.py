@@ -763,7 +763,6 @@ def ray_tune_pipeline(args):
         return args
 
     args.local_rank, args.rank, args.world_size = world_info_from_env()
-    args.distributed = True
     setup_paths(args)
     setup_train(args, checkpoint_prefix=f"stage_{args.stage}_")
     if args.eval_loss is None:
@@ -783,11 +782,10 @@ def ray_tune_pipeline(args):
         )
 
         register_ray()
+
     run_config = RunConfig(
         callbacks=[
-            WandbLoggerCallback(
-                project=args.wandb_project_name, entity=args.wandb_entity
-            ),
+            WandbLoggerCallback(project=args.wandb_project_name),
         ],
         sync_config=ray.train.SyncConfig(),
         stop={"training_iteration": args.training_iteration},
@@ -800,7 +798,7 @@ def ray_tune_pipeline(args):
         mode=mode,
     )
     if args.resume_from:
-        print(f"Restoring previous state from {args.resume_from}")
+        logger.info(f"Restoring previous state from {args.resume_from}")
         optuna_search.restore_from_dir(args.resume_from)
 
     tuner = tune.Tuner(
