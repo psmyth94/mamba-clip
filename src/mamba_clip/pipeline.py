@@ -71,6 +71,7 @@ def setup_paths(args):
                 "Error. Experiment already exists. Use --name {} to specify a new experiment."
             )
             return -1
+    return args
 
 
 def setup_train(args, checkpoint_prefix=""):
@@ -169,6 +170,7 @@ def setup_train(args, checkpoint_prefix=""):
         )
     else:
         logger.info(f"Running with a single process. Device {args.device}.")
+    return args
 
 
 def prepare_params(model, data, device, args, setup_logging=True):

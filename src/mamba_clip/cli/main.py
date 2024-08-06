@@ -109,6 +109,8 @@ class Args:
     rank: int = 0
     local_rank: int = 0
     world_size: int = 1
+    tensorboard: bool = False
+    wandb: bool = False
 
 
 def arg_parser():
@@ -473,9 +475,6 @@ def arg_parser():
 def main():
     logger_setup()
     args = arg_parser()
-    args.stage = 1
-    args.model_stage_1 = "medmamba"
-    args.small_test = True
     if args.hyperparameter_tuning:
         from mamba_clip.integrations.ray import ray_tune_pipeline
 
