@@ -1,4 +1,5 @@
 # type: ignore
+import inspect
 import os
 from dataclasses import asdict
 from functools import partial
@@ -69,7 +70,18 @@ class Trainable(tune.Trainable):
     def setup(self, config):
         from mamba_clip.cli.main import Args
 
-        args = Args(**config)
+        def get_kwargs(kwargs, method):
+            method_args = [
+                p.name
+                for p in inspect.signature(method).parameters.values()
+                if p != p.VAR_KEYWORD
+            ]
+            return {k: kwargs[k] for k in method_args if k in kwargs}
+
+        config_kwargs = get_kwargs(config, Args.__init__)
+        args = Args(**config_kwargs)
+        for k, v in config.items():
+            setattr(args, k, v)
         device = "cuda" if torch.cuda.is_available() else "cpu"
         tokenizer = None
         if args.stage == 1:
