@@ -48,6 +48,43 @@ except ImportError:
 logger = get_logger(__name__)
 
 
+try:
+    import optuna
+    import ray
+    from ray import tune
+    from ray.air import CheckpointConfig, RunConfig
+    from ray.air.integrations.wandb import WandbLoggerCallback
+    from ray.tune.schedulers import ASHAScheduler
+    from ray.tune.search.optuna import OptunaSearch
+    from ray.util.joblib import register_ray
+except ImportError:
+    ray = None
+    tune = None
+    optuna = None
+
+
+def suggest_config(trial: optuna.Trial, args) -> dict[str, Any]:
+    args.lr = trial.suggest_float("lr", 1e-6, 1e-3, log=True)
+    args.beta1 = trial.suggest_float("beta1", 0.9, 0.999)
+    args.beta2 = trial.suggest_float("beta2", 0.9, 0.999)
+    args.eps = trial.suggest_float("eps", 1e-9, 1e-7, log=True)
+    args.wd = trial.suggest_float("wd", 1e-4, 1e-1, log=True)
+    args.warmup = trial.suggest_float("warmup", 0, 1)
+    args.lr_scheduler = trial.suggest_categorical(
+        "lr_scheduler", ["cosine", "const", "const_cooldown"]
+    )
+    args.lr_restart_interval = trial.suggest_categorical(
+        "lr_restart_interval", [1, None]
+    )
+    args.lr_cooldown_end = trial.suggest_float("lr_cooldown_end", 1e-6, 1e-3, log=True)
+    args.lr_cooldown_power = trial.suggest_float("lr_cooldown_power", 0.5, 1.5)
+    args.batch_size = trial.suggest_int("batch_size", 8, 128)
+    args.accum_freq = trial.suggest_int("accum_freq", 1, 4)
+    args.grad_clip_norm = trial.suggest_float("grad_clip_norm", 1e-2, 1e2, log=True)
+    args.balanced_mixup = trial.suggest_float("balanced_mixup", 0.0, 1.0)
+    return asdict(args)
+
+
 def setup_paths(args):
     # get the name of the experiments
     if args.stage == 1:
@@ -617,19 +654,7 @@ def pipeline(args):
     return metrics
 
 
-def ray_tune_pipeline(args):
-    try:
-        import optuna
-        import ray
-        from ray import tune
-        from ray.air import CheckpointConfig, RunConfig
-        from ray.air.integrations.wandb import WandbLoggerCallback
-        from ray.tune.schedulers import ASHAScheduler
-        from ray.tune.search.optuna import OptunaSearch
-        from ray.util.joblib import register_ray
-    except ImportError:
-        print("Please install ray[tune] and optuna")
-        return
+if ray is not None:
 
     class Trainable(tune.Trainable):
         def setup(self, config):
@@ -744,29 +769,11 @@ def ray_tune_pipeline(args):
         def load_checkpoint(self, checkpoint_path):
             self.model.load_state_dict(torch.load(checkpoint_path))
 
-    def suggest_config(trial: optuna.Trial) -> dict[str, Any]:
-        args.lr = trial.suggest_float("lr", 1e-6, 1e-3, log=True)
-        args.beta1 = trial.suggest_float("beta1", 0.9, 0.999)
-        args.beta2 = trial.suggest_float("beta2", 0.9, 0.999)
-        args.eps = trial.suggest_float("eps", 1e-9, 1e-7, log=True)
-        args.wd = trial.suggest_float("wd", 1e-4, 1e-1, log=True)
-        args.warmup = trial.suggest_float("warmup", 0, 1)
-        args.lr_scheduler = trial.suggest_categorical(
-            "lr_scheduler", ["cosine", "const", "const_cooldown"]
-        )
-        args.lr_restart_interval = trial.suggest_categorical(
-            "lr_restart_interval", [1, None]
-        )
-        args.lr_cooldown_end = trial.suggest_float(
-            "lr_cooldown_end", 1e-6, 1e-3, log=True
-        )
-        args.lr_cooldown_power = trial.suggest_float("lr_cooldown_power", 0.5, 1.5)
-        args.batch_size = trial.suggest_int("batch_size", 8, 128)
-        args.accum_freq = trial.suggest_int("accum_freq", 1, 4)
-        args.grad_clip_norm = trial.suggest_float("grad_clip_norm", 1e-2, 1e2, log=True)
-        args.balanced_mixup = trial.suggest_float("balanced_mixup", 0.0, 1.0)
-        return asdict(args)
+else:
+    Trainable = None
 
+
+def ray_tune_pipeline(args):
     args.local_rank, args.rank, args.world_size = world_info_from_env()
     setup_paths(args)
     setup_train(args, checkpoint_prefix=f"stage_{args.stage}_")
