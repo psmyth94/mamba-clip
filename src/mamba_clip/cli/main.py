@@ -111,7 +111,6 @@ class Args:
     world_size: int = 1
 
 
-
 def arg_parser():
     parser = argparse.ArgumentParser(description="Argument parser for training script")
 

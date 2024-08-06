@@ -83,6 +83,7 @@ class Trainable(tune.Trainable):
         for k, v in config.items():
             setattr(args, k, v)
         device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = torch.device(device)
         tokenizer = None
         if args.stage == 1:
             model_stage_1, preprocess_train, preprocess_val, tokenizer = init_model(
