@@ -63,6 +63,32 @@ def backward(total_loss, scaler):
         total_loss.backward()
 
 
+def get_model_inputs(
+    args,
+    images,
+    texts,
+    targets=None,
+    balanced_images=None,
+    balanced_texts=None,
+    balanced_targets=None,
+):
+    if args.balanced_mixup:
+        lam = np.random.beta(a=args.balanced_mixup, b=1)
+
+        images = (1 - lam) * images + lam * balanced_images
+        if lam > 0.5 and texts is not None and balanced_texts is not None:
+            texts = balanced_texts
+
+        n_classes = args.num_classes
+        targets = F.one_hot(targets, n_classes)
+        targets = (1 - lam) * targets + lam * F.one_hot(balanced_targets, n_classes)
+    if texts is None:
+        input = (images,)
+    else:
+        input = (images, texts)
+    return input
+
+
 def train_one_epoch(
     model,
     data,
@@ -140,32 +166,23 @@ def train_one_epoch(
 
         if args.accum_freq == 1:
             with autocast():
-                if args.balanced_mixup:
-                    lam = np.random.beta(a=args.balanced_mixup, b=1)
-
-                    images = (1 - lam) * images + lam * balanced_images
-                    if lam > 0.5 and texts is not None and balanced_texts is not None:
-                        texts = balanced_texts
-
-                    n_classes = args.num_classes
-                    targets = F.one_hot(targets, n_classes)
-                    targets = (1 - lam) * targets + lam * F.one_hot(
-                        balanced_targets, n_classes
-                    )
+                input = get_model_inputs(
+                    args,
+                    images,
+                    texts,
+                    targets,
+                    balanced_images,
+                    balanced_texts,
+                    balanced_targets,
+                )
+                if balanced_images is not None:
                     del balanced_images
+                if balanced_targets is not None:
                     del balanced_targets
-                    if balanced_texts is not None:
-                        del balanced_texts
-                if texts is None:
-                    input = (images,)
-                else:
-                    input = (images, texts)
+                if balanced_texts is not None:
+                    del balanced_texts
                 model_out = model(*input)
-                logit_scale = None
-                if isinstance(model_out, dict):
-                    if "logit_scale" in model_out:
-                        logit_scale = model_out["logit_scale"]
-                else:
+                if not isinstance(model_out, dict):
                     model_out = {"input": model_out}
                 losses = loss(**model_out, target=targets)
 
@@ -180,7 +197,24 @@ def train_one_epoch(
             # First, cache the features without any gradient tracking.
             with torch.no_grad():
                 with autocast():
-                    model_out = model(images, texts)
+                    input = get_model_inputs(
+                        args,
+                        images,
+                        texts,
+                        targets,
+                        balanced_images,
+                        balanced_texts,
+                        balanced_targets,
+                    )
+                    if balanced_images is not None:
+                        del balanced_images
+                    if balanced_targets is not None:
+                        del balanced_targets
+                    if balanced_texts is not None:
+                        del balanced_texts
+                    model_out = model(*input)
+                    if not isinstance(model_out, dict):
+                        model_out = {"input": model_out}
 
                     for f in ("logit_scale", "logit_bias"):
                         model_out.pop(f, None)
@@ -207,14 +241,28 @@ def train_one_epoch(
                 images = accum_images[j]
                 texts = accum_texts[j]
                 with autocast():
-                    model_out = model(images, texts)
+                    input = get_model_inputs(
+                        args,
+                        images,
+                        texts,
+                        targets,
+                        balanced_images,
+                        balanced_texts,
+                        balanced_targets,
+                    )
+                    model_out = model(*input)
+                    if not isinstance(model_out, dict):
+                        model_out = {"input": model_out}
 
                     inputs_no_accum = {}
-                    inputs_no_accum["logit_scale"] = logit_scale = model_out.pop(
-                        "logit_scale"
-                    )
+                    if "logit_scale" in model_out:
+                        inputs_no_accum["logit_scale"] = logit_scale = model_out.pop(
+                            "logit_scale", None
+                        )
                     if "logit_bias" in model_out:
-                        inputs_no_accum["logit_bias"] = model_out.pop("logit_bias")
+                        inputs_no_accum["logit_bias"] = model_out.pop(
+                            "logit_bias", None
+                        )
 
                     inputs = {}
                     for key, val in accum_features.items():
@@ -223,11 +271,16 @@ def train_one_epoch(
                             accumulated[:j] + [model_out[key]] + accumulated[j + 1 :]
                         )
 
-                    losses = loss(**inputs, **inputs_no_accum, output_dict=True)
+                    losses = loss(**model_out, target=targets)
+
                     del inputs
                     del inputs_no_accum
-                    total_loss = sum(losses.values())
-                    losses["loss"] = total_loss
+                    if isinstance(losses, dict):
+                        total_loss = sum(losses.values())
+                        losses["loss"] = total_loss
+                    else:
+                        total_loss = losses
+                        losses = {"loss": losses}
 
                 backward(total_loss, scaler)
 

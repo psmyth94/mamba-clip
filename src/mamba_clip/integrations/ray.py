@@ -58,7 +58,7 @@ def suggest_config(trial: optuna.Trial, args) -> dict[str, Any]:
     args.lr_cooldown_end = trial.suggest_float("lr_cooldown_end", 1e-6, 1e-3, log=True)
     args.lr_cooldown_power = trial.suggest_float("lr_cooldown_power", 0.5, 1.5)
     args.batch_size = trial.suggest_int("batch_size", 8, 128)
-    args.accum_freq = trial.suggest_int("accum_freq", 1, 4)
+    args.accum_freq = 1
     args.grad_clip_norm = trial.suggest_float("grad_clip_norm", 1e-2, 1e2, log=True)
     args.balanced_mixup = trial.suggest_float("balanced_mixup", 0.0, 1.0)
     return asdict(args)
