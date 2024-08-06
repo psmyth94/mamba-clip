@@ -51,9 +51,7 @@ def suggest_config(trial: optuna.Trial, args) -> dict[str, Any]:
     args.eps = trial.suggest_float("eps", 1e-9, 1e-7, log=True)
     args.wd = trial.suggest_float("wd", 1e-4, 1e-1, log=True)
     args.warmup = trial.suggest_float("warmup", 0, 1)
-    args.lr_scheduler = trial.suggest_categorical(
-        "lr_scheduler", ["cosine", "const", "const-cooldown"]
-    )
+    args.lr_scheduler = "cosine"
     args.lr_restart_interval = trial.suggest_categorical(
         "lr_restart_interval", [1, None]
     )
@@ -192,8 +190,8 @@ def ray_tune_pipeline(args):
     args.local_rank, args.rank, args.world_size = world_info_from_env()
     # 1 gpu per trial
     args.distributed = False
-    setup_paths(args)
-    setup_train(args, checkpoint_prefix=f"stage_{args.stage}_")
+    args = setup_paths(args)
+    args = setup_train(args, checkpoint_prefix=f"stage_{args.stage}_")
     if args.eval_loss is None:
         args.eval_loss = "val_loss"
         mode = "min"
