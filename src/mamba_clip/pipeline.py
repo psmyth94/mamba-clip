@@ -18,7 +18,12 @@ from mamba_clip.loss import ClipLoss, cross_entropy_loss
 from mamba_clip.model import ClipClassifier, init_model
 from mamba_clip.scheduler import const_lr, const_lr_cooldown, cosine_lr
 from mamba_clip.train import LATEST_CHECKPOINT_NAME, train_one_epoch
-from mamba_clip.utils.dist_utils import broadcast_object, init_device, is_master
+from mamba_clip.utils.dist_utils import (
+    broadcast_object,
+    init_device,
+    is_master,
+    world_info_from_env,
+)
 from mamba_clip.utils.file_utils import (
     load_checkpoint,
     pt_load,
@@ -757,6 +762,8 @@ def ray_tune_pipeline(args):
         args.balanced_mixup = trial.suggest_float("balanced_mixup", 0.0, 1.0)
         return args
 
+    args.local_rank, args.rank, args.world_size = world_info_from_env()
+    args.distributed = True
     setup_paths(args)
     setup_train(args, checkpoint_prefix=f"stage_{args.stage}_")
     if args.eval_loss is None:
