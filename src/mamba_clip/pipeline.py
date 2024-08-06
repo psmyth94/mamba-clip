@@ -788,7 +788,7 @@ def ray_tune_pipeline(args):
             WandbLoggerCallback(project=args.wandb_project_name),
         ],
         sync_config=ray.train.SyncConfig(),
-        stop={"training_iteration": args.training_iteration},
+        stop={"training_iteration": args.training_iterations},
         checkpoint_config=CheckpointConfig(checkpoint_at_end=True),
         name=args.name,
     )
