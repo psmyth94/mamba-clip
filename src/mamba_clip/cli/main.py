@@ -1,8 +1,110 @@
 # type: ignore
 import argparse
+from dataclasses import dataclass, field
+from typing import List, Optional, Type, Union
 
 from mamba_clip.pipeline import pipeline, ray_tune_pipeline
 from mamba_clip.utils.logging import logger_setup
+
+
+@dataclass
+class Args:
+    data_path: str
+    val_data_path: Optional[str] = None
+    train_num_samples: Optional[int] = None
+    val_num_samples: Optional[int] = None
+    zero_shot: bool = False
+    num_classes: int = None
+    sampling: Optional[str] = None
+    undersample: Optional[int] = None
+    undersample_by: Optional[str] = None
+    undersample_sort_by: Optional[str] = None
+    add_remaining_samples: bool = False
+    balanced_mixup: bool = False
+    device: str = "auto"
+    logs: str = "./logs/"
+    log_local: bool = False
+    name: Optional[str] = None
+    workers: int = 4
+    batch_size: int = 64
+    epochs: int = 3
+    epochs_cooldown: Optional[int] = None
+    lr: Optional[float] = 1e-4
+    beta1: Optional[float] = None
+    beta2: Optional[float] = None
+    eps: Optional[float] = None
+    wd: float = 0.2
+    warmup: int = 10000
+    use_bn_sync: bool = False
+    skip_scheduler: bool = False
+    lr_scheduler: str = "cosine"
+    lr_restart_interval: Optional[int] = None
+    lr_cooldown_end: float = 0.0
+    lr_cooldown_power: float = 1.0
+    save_frequency: int = 1
+    save_most_recent: bool = False
+    val_frequency: int = 1
+    resume: Optional[str] = None
+    precision: str = "amp"
+    stage: int = 1
+    model_stage_1: Union[Type, str] = (
+        "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+    )
+    model_stage_2: Optional[Union[Type, str]] = None
+    use_inner_prod: bool = False
+    use_visual_only: bool = False
+    use_text_only: bool = False
+    use_original_model: bool = False
+    tokenizer: Optional[Union[Type, str]] = None
+    lock_image: bool = False
+    lock_image_unlocked_groups: int = 0
+    lock_image_freeze_bn_stats: bool = False
+    image_mean: Optional[List[float]] = None
+    image_std: Optional[List[float]] = None
+    image_interpolation: Optional[str] = None
+    image_resize_mode: Optional[str] = None
+    aug_cfg: Optional[List[str]] = field(default_factory=list)
+    grad_checkpointing: bool = False
+    local_loss: bool = False
+    gather_with_grad: bool = False
+    force_image_size: Optional[List[int]] = None
+    force_quick_gelu: bool = False
+    force_patch_dropout: Optional[float] = None
+    force_custom_text: bool = False
+    torchscript: bool = False
+    torchcompile: bool = False
+    trace: bool = False
+    accum_freq: int = 1
+    dist_url: str = "env://"
+    dist_backend: str = "nccl"
+    report_to: str = ""
+    wandb_notes: str = ""
+    wandb_project_name: str = "mamba-clip"
+    debug: bool = False
+    copy_codebase: bool = False
+    ddp_static_graph: bool = False
+    no_set_device_rank: bool = False
+    seed: int = 42
+    grad_clip_norm: Optional[float] = None
+    lock_text: bool = False
+    lock_text_unlocked_layers: int = 0
+    lock_text_freeze_layer_norm: bool = True
+    log_every_n_steps: int = 100
+    hyperparameter_tuning: bool = False
+    training_iterations: int = 30
+    eval_loss: Optional[str] = None
+    study_name: str = "mamba_clip_study"
+    class_weighted_loss: bool = False
+    coca_caption_loss_weight: float = 2.0
+    coca_contrastive_loss_weight: float = 1.0
+    distributed: bool = False
+    remote_sync: Optional[str] = None
+    remote_sync_frequency: int = 300
+    remote_sync_protocol: str = "fsspec"
+    delete_previous_checkpoint: bool = False
+    use_bnb_linear: Optional[str] = None
+    siglip: bool = False
+    small_test: bool = False
 
 
 def arg_parser():
@@ -361,7 +463,7 @@ def arg_parser():
     )
 
     args = parser.parse_args()
-    return args
+    return Args(**vars(args))
 
 
 def main():

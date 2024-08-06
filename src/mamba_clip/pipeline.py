@@ -1,9 +1,11 @@
 # type: ignore
+from dataclasses import asdict
 import logging
 import os
 from argparse import Namespace
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -630,7 +632,10 @@ def ray_tune_pipeline(args):
         return
 
     class Trainable(tune.Trainable):
-        def setup(self, args):
+        def setup(self, config):
+            from mamba_clip.cli.main import Args
+
+            args = Args(**config)
             device = "cuda" if torch.cuda.is_available() else "cpu"
             tokenizer = None
             if args.stage == 1:
@@ -739,7 +744,7 @@ def ray_tune_pipeline(args):
         def load_checkpoint(self, checkpoint_path):
             self.model.load_state_dict(torch.load(checkpoint_path))
 
-    def suggest_config(trial: optuna.Trial) -> Namespace:
+    def suggest_config(trial: optuna.Trial) -> dict[str, Any]:
         args.lr = trial.suggest_float("lr", 1e-6, 1e-3, log=True)
         args.beta1 = trial.suggest_float("beta1", 0.9, 0.999)
         args.beta2 = trial.suggest_float("beta2", 0.9, 0.999)
@@ -760,7 +765,7 @@ def ray_tune_pipeline(args):
         args.accum_freq = trial.suggest_int("accum_freq", 1, 4)
         args.grad_clip_norm = trial.suggest_float("grad_clip_norm", 1e-2, 1e2, log=True)
         args.balanced_mixup = trial.suggest_float("balanced_mixup", 0.0, 1.0)
-        return args
+        return asdict(args)
 
     args.local_rank, args.rank, args.world_size = world_info_from_env()
     setup_paths(args)
@@ -770,23 +775,25 @@ def ray_tune_pipeline(args):
         mode = "min"
     elif args.eval_loss in ["partial_auc", "auc", "acc"]:
         mode = "max"
-    if wandb is not None:
-        wandb.init(
-            project=args.wandb_project_name,
-            name=args.name,
-            id=args.name,
-            notes=args.wandb_notes,
-            tags=[],
-            resume="auto" if args.resume == "latest" else None,
-            config=vars(args),
-        )
-    if is_master(args) and args.distributed:
+    # if wandb is not None:
+    #     wandb.init(
+    #         project=args.wandb_project_name,
+    #         name=args.name,
+    #         id=args.name,
+    #         notes=args.wandb_notes,
+    #         tags=[],
+    #         resume="auto" if args.resume == "latest" else None,
+    #         config=vars(args),
+    #     )
+    if args.distributed:
         ip_head = os.environ["ip_head"]
         redis_password = os.environ["redis_password"]
-        logger.info(f"ip head: {ip_head}")
-        logger.info(f"redis pwd: {redis_password}")
+        if is_master(args):
+            logger.info(f"ip head: {ip_head}")
+            logger.info(f"redis pwd: {redis_password}")
         _node_ip_addr = ip_head.split(":")[0]
-        logger.info(f"node ip addr: {_node_ip_addr}")
+        if is_master(args):
+            logger.info(f"node ip addr: {_node_ip_addr}")
         ray.init(
             address=ip_head,
             _redis_password=redis_password,
