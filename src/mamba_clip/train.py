@@ -326,6 +326,7 @@ def train_one_epoch(
                     losses_m[key] = AverageMeter()
                 losses_m[key].update(val.item(), batch_size)
 
+            logit_scale = model_out.get("logit_scale", None)
             logit_scale_scalar = logit_scale.item() if logit_scale is not None else None
             loss_log = " ".join([
                 f"{loss_name.capitalize()}: {loss_m.val:#.5g} ({loss_m.avg:#.5g})"
