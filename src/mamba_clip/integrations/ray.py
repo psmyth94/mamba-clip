@@ -62,7 +62,7 @@ def suggest_config(trial: optuna.Trial, args) -> dict[str, Any]:
     args.accum_freq = 1
     args.grad_clip_norm = trial.suggest_float("grad_clip_norm", 1e-2, 1e2, log=True)
     args.balanced_mixup = trial.suggest_float("balanced_mixup", 0.0, 1.0)
-    return asdict(args)
+    return args.__dict__
 
 
 class Trainable(tune.Trainable):
