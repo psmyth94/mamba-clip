@@ -173,7 +173,7 @@ def setup_train(args, checkpoint_prefix=""):
     return args
 
 
-def prepare_params(model, data, device, args, setup_logging=True):
+def prepare_params(model, data, device, args):
     if (
         isinstance(args.force_image_size, (tuple, list))
         and len(args.force_image_size) == 1
@@ -351,11 +351,16 @@ def prepare_params(model, data, device, args, setup_logging=True):
     # determine if this worker should save logs and checkpoints. only do so if it is rank == 0
     args.save_logs = args.logs and args.logs.lower() != "none" and is_master(args)
     writer = None
-    if args.save_logs and args.tensorboard and setup_logging:
+    if args.save_logs and args.tensorboard and not args.hyperparameter_tuning:
         assert tensorboard is not None, "Please install tensorboard."
         writer = tensorboard.SummaryWriter(args.tensorboard_path)
 
-    if args.wandb and is_master(args) and args.epochs > 0 and setup_logging:
+    if (
+        args.wandb
+        and is_master(args)
+        and args.epochs > 0
+        and not args.hyperparameter_tuning
+    ):
         assert wandb is not None, "Please install wandb."
         logger.debug("Starting wandb.")
         args.train_sz = data["train"].dataloader.num_samples
@@ -497,7 +502,7 @@ def step(
                 )
                 torch.save(checkpoint_dict, tmp_save_path)
                 os.replace(tmp_save_path, latest_save_path)
-    if args.wandb and is_master(args):
+    if args.wandb and is_master(args) and not args.hyperparameter_tuning:
         wandb.finish()
 
     return metrics

@@ -1,22 +1,15 @@
 # type: ignore
 import inspect
 import os
-from dataclasses import asdict
 from functools import partial
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import optuna
-import ray
 import torch
-from ray import tune
-from ray.air import CheckpointConfig, RunConfig
-from ray.air.integrations.wandb import WandbLoggerCallback
-from ray.tune.schedulers import ASHAScheduler
-from ray.tune.search.optuna import OptunaSearch
-from ray.util.joblib import register_ray
 
+import ray
 from mamba_clip.data import get_data
 from mamba_clip.loss import ClipLoss, cross_entropy_loss
 from mamba_clip.model import ClipClassifier, init_model
@@ -31,6 +24,12 @@ from mamba_clip.utils.file_utils import (
     pt_load,
 )
 from mamba_clip.utils.logging import create_log_path, get_logger
+from ray import tune
+from ray.air import CheckpointConfig, RunConfig
+from ray.air.integrations.wandb import WandbLoggerCallback
+from ray.tune.schedulers import ASHAScheduler
+from ray.tune.search.optuna import OptunaSearch
+from ray.util.joblib import register_ray
 
 try:
     import wandb
@@ -196,6 +195,7 @@ def ray_tune_pipeline(args):
     args.local_rank, args.rank, args.world_size = world_info_from_env()
     # 1 gpu per trial
     args.distributed = False
+    args.wandb = True
     args = setup_paths(args)
     args = setup_train(args, checkpoint_prefix=f"stage_{args.stage}_")
     if args.eval_loss is None:
@@ -232,7 +232,7 @@ def ray_tune_pipeline(args):
 
     run_config = RunConfig(
         callbacks=[
-            WandbLoggerCallback(project=args.wandb_project_name),
+            WandbLoggerCallback(project=args.wandb_project_name, config=vars(args)),
         ],
         sync_config=ray.train.SyncConfig(),
         stop={"training_iteration": args.training_iterations},
