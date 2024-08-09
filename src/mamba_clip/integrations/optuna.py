@@ -112,7 +112,7 @@ def optuna_pipeline(args):
     study.optimize(
         lambda trial: optimize(
             trial,
-            *setup(args, load_data=True),
+            data=load_data(args),
         ),
         n_trials=args.training_iterations,
     )
