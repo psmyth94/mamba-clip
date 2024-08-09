@@ -36,8 +36,8 @@ logger = get_logger(__name__)
 
 
 def load_data(args):
-    preprocess_train = get_transform({}, {}, is_train=True)
-    preprocess_val = get_transform({}, {}, is_train=False)
+    preprocess_train = get_transform(is_train=True)
+    preprocess_val = get_transform(is_train=False)
     return get_data(args, preprocess_train, preprocess_val)
 
 
