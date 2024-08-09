@@ -55,6 +55,8 @@ def setup(args, data, device):
 def optimize(trial: optuna.Trial, data, args) -> dict[str, Any]:
     new_args = copy.deepcopy(args)
     device = init_device(new_args)
+    new_args = setup_paths(new_args)
+    new_args = setup_train(new_args, checkpoint_prefix=f"stage_{new_args.stage}_")
     new_args.epochs = trial.suggest_int("epochs", 1, 5)
     new_args.lr = trial.suggest_float("lr", 1e-6, 1e-3, log=True)
     new_args.beta1 = trial.suggest_float("beta1", 0.9, 0.999)
@@ -87,10 +89,10 @@ def optimize(trial: optuna.Trial, data, args) -> dict[str, Any]:
         args=new_args,
         save_prefix=f"stage_{new_args.stage}_",
     )
-    del params
     if args.distributed:
         # Cleanup dist
         torch.distributed.destroy_process_group()
+    del params
     return metrics[new_args.eval_loss]
 
 
@@ -98,10 +100,6 @@ def optuna_pipeline(args):
     from optuna.samplers import TPESampler
     from optuna.study.study import create_study
 
-    args.lr *= args.world_size
-
-    args = setup_paths(args)
-    args = setup_train(args, checkpoint_prefix=f"stage_{args.stage}_")
     if args.eval_loss is None:
         args.eval_loss = "val_loss"
         mode = "min"
@@ -119,6 +117,7 @@ def optuna_pipeline(args):
         n_trials=args.training_iterations,
     )
 
+    args = setup_paths(args)
     # save study
     with open(os.path.join(args.log_base_path, "study.joblib"), "wb") as f:
         joblib.dump(study, f)

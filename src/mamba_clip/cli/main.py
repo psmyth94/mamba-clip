@@ -476,9 +476,9 @@ def main():
     logger_setup()
     args = arg_parser()
     if args.hyperparameter_tuning:
-        from mamba_clip.integrations.ray import ray_tune_pipeline
+        from mamba_clip.integrations.optuna import optuna_pipeline
 
-        ray_tune_pipeline(args)
+        optuna_pipeline(args)
     else:
         pipeline(args)
 
