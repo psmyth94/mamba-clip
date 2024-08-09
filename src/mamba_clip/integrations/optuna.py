@@ -1,19 +1,25 @@
 # type: ignore
-import os
-import joblib
 import copy
+import os
 from functools import partial
 from typing import Any
 
+import joblib
 import numpy as np
-import optuna
 import torch
+import torch.distributed as dist
 
+import optuna
 from mamba_clip.data import get_data, get_transform
 from mamba_clip.loss import cross_entropy_loss
 from mamba_clip.model import VSSM
 from mamba_clip.pipeline import prepare_params, setup_paths, setup_train, step
-from mamba_clip.utils.dist_utils import init_device
+from mamba_clip.utils.dist_utils import (
+    broadcast_object,
+    init_device,
+    is_master,
+    world_info_from_env,
+)
 from mamba_clip.utils.logging import get_logger
 
 try:
@@ -55,25 +61,33 @@ def setup(args, data, device):
 def optimize(trial: optuna.Trial, data, args) -> dict[str, Any]:
     new_args = copy.deepcopy(args)
     device = init_device(new_args)
+    model_params = {}
+    if is_master(new_args):
+        model_params["epochs"] = trial.suggest_int("epochs", 1, 5)
+        model_params["lr"] = trial.suggest_float("lr", 1e-6, 1e-3, log=True)
+        model_params["beta1"] = trial.suggest_float("beta1", 0.9, 0.999)
+        model_params["beta2"] = trial.suggest_float("beta2", 0.9, 0.999)
+        model_params["eps"] = trial.suggest_float("eps", 1e-9, 1e-7, log=True)
+        model_params["wd"] = trial.suggest_float("wd", 1e-4, 1e-1, log=True)
+        model_params["warmup"] = trial.suggest_float("warmup", 0, 1)
+        model_params["lr_scheduler"] = "cosine"
+        model_params["lr_restart_interval"] = trial.suggest_categorical(
+            "lr_restart_interval", [1, None]
+        )
+        model_params["batch_size"] = trial.suggest_categorical(
+            "batch_size", [8, 16, 32, 64, 128, 256]
+        )
+        model_params["accum_freq"] = 1
+        model_params["grad_clip_norm"] = trial.suggest_float(
+            "grad_clip_norm", 1e-2, 1e2, log=True
+        )
+        model_params["balanced_mixup"] = trial.suggest_float("balanced_mixup", 0.0, 1.0)
+    if args.distributed:
+        model_params = broadcast_object(new_args, model_params, src=0)
+        for k, v in model_params.items():
+            setattr(new_args, k, v)
     new_args = setup_paths(new_args)
     new_args = setup_train(new_args, checkpoint_prefix=f"stage_{new_args.stage}_")
-    new_args.epochs = trial.suggest_int("epochs", 1, 5)
-    new_args.lr = trial.suggest_float("lr", 1e-6, 1e-3, log=True)
-    new_args.beta1 = trial.suggest_float("beta1", 0.9, 0.999)
-    new_args.beta2 = trial.suggest_float("beta2", 0.9, 0.999)
-    new_args.eps = trial.suggest_float("eps", 1e-9, 1e-7, log=True)
-    new_args.wd = trial.suggest_float("wd", 1e-4, 1e-1, log=True)
-    new_args.warmup = trial.suggest_float("warmup", 0, 1)
-    new_args.lr_scheduler = "cosine"
-    new_args.lr_restart_interval = trial.suggest_categorical(
-        "lr_restart_interval", [1, None]
-    )
-    new_args.batch_size = trial.suggest_categorical(
-        "batch_size", [8, 16, 32, 64, 128, 256]
-    )
-    new_args.accum_freq = 1
-    new_args.grad_clip_norm = trial.suggest_float("grad_clip_norm", 1e-2, 1e2, log=True)
-    new_args.balanced_mixup = trial.suggest_float("balanced_mixup", 0.0, 1.0)
     new_args, params = setup(new_args, data, device)
 
     metrics = step(
@@ -90,8 +104,8 @@ def optimize(trial: optuna.Trial, data, args) -> dict[str, Any]:
         save_prefix=f"stage_{new_args.stage}_",
     )
     if args.distributed:
-        # Cleanup dist
-        torch.distributed.destroy_process_group()
+        dist.barrier()
+        dist.destroy_process_group()
     del params
     return metrics[new_args.eval_loss]
 
@@ -102,22 +116,28 @@ def optuna_pipeline(args):
 
     if args.eval_loss is None:
         args.eval_loss = "val_loss"
-        mode = "min"
+        mode = "mininimize"
     elif args.eval_loss in ["partial_auc", "auc", "acc"]:
-        mode = "max"
+        mode = "maximize"
 
-    sampler = TPESampler(seed=42, multivariate=True)
-    study = create_study(direction=mode, study_name="AutoTrain", sampler=sampler)
+    _, global_rank, _ = world_info_from_env()
 
-    study.optimize(
-        lambda trial: optimize(
-            trial,
-            data=load_data(args),
-        ),
-        n_trials=args.training_iterations,
-    )
+    if global_rank == 0:
+        sampler = TPESampler(seed=42, multivariate=True)
+        study = create_study(direction=mode, study_name="AutoTrain", sampler=sampler)
 
-    args = setup_paths(args)
-    # save study
-    with open(os.path.join(args.log_base_path, "study.joblib"), "wb") as f:
-        joblib.dump(study, f)
+        study.optimize(
+            lambda trial: optimize(
+                trial,
+                data=load_data(args),
+            ),
+            n_trials=args.training_iterations,
+        )
+
+        args = setup_paths(args)
+        # save study
+        with open(os.path.join(args.log_base_path, "study.joblib"), "wb") as f:
+            joblib.dump(study, f)
+    else:
+        for _ in range(args.training_iterations):
+            optimize(None, args, load_data(args))
