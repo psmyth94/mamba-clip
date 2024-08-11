@@ -445,6 +445,8 @@ def logger_setup(output_dir=None, log_file=None, rank=None, local_rank=None) -> 
         elif log_file is None and sys.stderr is not None:
             # add rank to log file name
             log_file = Path(sys.stderr.name).stem
+            if output_dir is None:
+                output_dir = os.path.dirname(sys.stderr.name)
             if rank is not None:
                 log_file += f"_rank_{rank}"
             if local_rank is not None:
