@@ -31,7 +31,7 @@ def world_info_from_env():
     return local_rank, global_rank, world_size
 
 
-def init_device(args):
+def init_device(args, init_process_group=True) -> torch.device:
     # Distributed training = training on more than one GPU.
     # Works in both single and multi-node scenarios.
     if torch.cuda.is_available() and (args.device == "auto" or "cuda" in args.device):

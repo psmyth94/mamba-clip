@@ -85,10 +85,10 @@ def setup(args, data, device):
 
 def optimize(trial: optuna.Trial, data, args) -> dict[str, Any]:
     new_args = copy.deepcopy(args)
-    if os.environ.get("LOCAL_RANK") is not None:
-        device = torch.device(f"cuda:{os.environ.get('LOCAL_RANK')}")
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    new_args.device = "cuda:%d" % args.local_rank if torch.cuda.is_available() else "cpu"
+    torch.cuda.set_device(new_args.device)
+    device = torch.device(new_args.device)
+
 
     new_args.epochs = trial.suggest_int("epochs", 1, 5)
     new_args.lr = trial.suggest_float("lr", 1e-6, 1e-3, log=True)
@@ -142,6 +142,10 @@ def optuna_pipeline(args):
 
     args.log_local = True
     sampler = TPESampler(seed=42, multivariate=True)
+
+    args.local_rank, args.rank, args.world_size = world_info_from_env()
+    args.world_size = 1
+
     if args.optuna_study_name is not None:
         storage = None
         if args.optuna_storage is not None:
