@@ -91,6 +91,9 @@ class Args:
     lock_text_freeze_layer_norm: bool = True
     log_every_n_steps: int = 100
     hyperparameter_tuning: bool = False
+    hyperparameter_strategy: str = "optuna"
+    optuna_study_name: str = "mamba_clip_study"
+    optuna_storage: Optional[str] = None
     training_iterations: int = 30
     eval_loss: Optional[str] = None
     study_name: str = "mamba_clip_study"
@@ -408,9 +411,26 @@ def arg_parser():
         help="Enable hyperparameter tuning",
     )
     parser.add_argument(
+        "--hyperparameter-strategy",
+        type=str,
+        default="optuna",
+        help="Enable hyperparameter tuning",
+    )
+    parser.add_argument(
+        "--optuna-study-name",
+        type=str,
+        default="mamba_clip_study",
+        help="Name of the Optuna study",
+    )
+    parser.add_argument(
+        "--optuna-storage",
+        type=str,
+        help="Optuna storage URL for distributed hyperparameter tuning",
+    )
+    parser.add_argument(
         "--training-iterations",
         type=int,
-        default=30,
+        default=100,
         help="Number of training iterations for hyperparameter tuning",
     )
     parser.add_argument(
@@ -476,9 +496,14 @@ def main():
     logger_setup()
     args = arg_parser()
     if args.hyperparameter_tuning:
-        from mamba_clip.integrations.optuna import optuna_pipeline
+        if args.hyperparameter_strategy == "optuna":
+            from mamba_clip.integrations.optuna import optuna_pipeline
 
-        optuna_pipeline(args)
+            optuna_pipeline(args)
+        else:
+            from mamba_clip.integrations.ray import ray_tune_pipeline
+
+            ray_tune_pipeline(args)
     else:
         pipeline(args)
 

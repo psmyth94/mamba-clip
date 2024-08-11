@@ -21,6 +21,9 @@ from mamba_clip.utils.dist_utils import (
     world_info_from_env,
 )
 from mamba_clip.utils.logging import get_logger
+from optuna.samplers import TPESampler
+from optuna.storages import RDBStorage, RedisStorage
+from optuna.study.study import create_study, load_study
 
 try:
     import wandb
@@ -111,9 +114,6 @@ def optimize(trial: optuna.Trial, data, args) -> dict[str, Any]:
 
 
 def optuna_pipeline(args):
-    from optuna.samplers import TPESampler
-    from optuna.study.study import create_study
-
     if args.eval_loss is None:
         args.eval_loss = "val_loss"
         mode = "mininimize"
@@ -122,22 +122,41 @@ def optuna_pipeline(args):
 
     _, global_rank, _ = world_info_from_env()
 
-    if global_rank == 0:
-        sampler = TPESampler(seed=42, multivariate=True)
+    sampler = TPESampler(seed=42, multivariate=True)
+    if args.optuna_study_name is not None:
+        storage = None
+        if args.optuna_storage is not None:
+            if args.optuna_storage.startswith("redis"):
+                storage = RedisStorage(url=args.optuna_storage)
+            else:
+                storage = RDBStorage(url=args.optuna_storage)
+        # check if study exists
+        if args.optuna_study_name in optuna.study.get_all_study_summaries():
+            study = load_study(
+                study_name=args.optuna_study_name,
+                direction=mode,
+                sampler=sampler,
+                storage=storage,
+            )
+        else:
+            study = create_study(
+                direction=mode,
+                study_name=args.optuna_study_name,
+                sampler=sampler,
+                storage=storage,
+            )
+    else:
         study = create_study(direction=mode, study_name="AutoTrain", sampler=sampler)
 
-        study.optimize(
-            lambda trial: optimize(
-                trial,
-                data=load_data(args),
-            ),
-            n_trials=args.training_iterations,
-        )
+    study.optimize(
+        lambda trial: optimize(
+            trial,
+            data=load_data(args),
+        ),
+        n_trials=args.training_iterations,
+    )
 
-        args = setup_paths(args)
-        # save study
-        with open(os.path.join(args.log_base_path, "study.joblib"), "wb") as f:
-            joblib.dump(study, f)
-    else:
-        for _ in range(args.training_iterations):
-            optimize(None, args, load_data(args))
+    args = setup_paths(args)
+    # save study
+    with open(os.path.join(args.log_base_path, "study.joblib"), "wb") as f:
+        joblib.dump(study, f)
