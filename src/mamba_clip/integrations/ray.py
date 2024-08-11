@@ -23,7 +23,7 @@ from mamba_clip.utils.file_utils import (
     load_checkpoint,
     pt_load,
 )
-from mamba_clip.utils.logging import create_log_path, get_logger
+from mamba_clip.utils.logging import create_log_path, get_logger, logger_setup
 from ray import tune
 from ray.air import CheckpointConfig, RunConfig
 from ray.air.integrations.wandb import WandbLoggerCallback
@@ -193,6 +193,7 @@ class Trainable(tune.Trainable):
 
 def ray_tune_pipeline(args):
     args.local_rank, args.rank, args.world_size = world_info_from_env()
+    logger_setup(rank=args.rank, local_rank=args.local_rank)
     # 1 gpu per trial
     args.distributed = False
     args.wandb = True

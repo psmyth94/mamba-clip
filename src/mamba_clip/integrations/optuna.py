@@ -26,7 +26,7 @@ from mamba_clip.utils.dist_utils import (
     is_master,
     world_info_from_env,
 )
-from mamba_clip.utils.logging import get_logger
+from mamba_clip.utils.logging import get_logger, logger_setup
 from optuna.samplers import TPESampler
 from optuna.storages import JournalRedisStorage, RDBStorage
 from optuna.study.study import create_study
@@ -157,6 +157,7 @@ def optuna_pipeline(args):
     args.local_rank, args.rank, args.world_size = world_info_from_env()
     args.world_size = 1
 
+    logger_setup(rank=args.rank, local_rank=args.local_rank)
     if args.optuna_study_name is not None:
         storage = None
         if args.optuna_storage is not None:

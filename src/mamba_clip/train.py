@@ -311,7 +311,7 @@ def train_one_epoch(
         batch_time_m.update(time.time() - end)
         end = time.time()
         batch_count = i_accum + 1
-        if is_master(args) and (
+        if (
             i_accum % args.log_every_n_steps == 0
             or batch_count == num_batches_per_epoch
         ):
@@ -328,10 +328,12 @@ def train_one_epoch(
 
             logit_scale = model_out.get("logit_scale", None)
             logit_scale_scalar = logit_scale.item() if logit_scale is not None else None
-            loss_log = " ".join([
-                f"{loss_name.capitalize()}: {loss_m.val:#.5g} ({loss_m.avg:#.5g})"
-                for loss_name, loss_m in losses_m.items()
-            ])
+            loss_log = " ".join(
+                [
+                    f"{loss_name.capitalize()}: {loss_m.val:#.5g} ({loss_m.avg:#.5g})"
+                    for loss_name, loss_m in losses_m.items()
+                ]
+            )
             samples_per_second = (
                 args.accum_freq * args.batch_size * args.world_size / batch_time_m.val
             )
@@ -348,7 +350,8 @@ def train_one_epoch(
                 log_info += f"Scale: {logit_scale_scalar:.3f} "
             log_info += loss_log
 
-            logger.info(log_info)
+            if is_master(args):
+                logger.info(log_info)
 
             # Save train loss / etc. Using non avg meter values as loggers have their own smoothing
             log_data = {
@@ -367,7 +370,7 @@ def train_one_epoch(
                 for name, val in log_data.items():
                     tb_writer.add_scalar(name, val, step)
 
-            if args.wandb:
+            if args.wandb and (is_master(args) or args.hyperparameter_tuning):
                 assert wandb is not None, "Please install wandb."
                 log_data["step"] = step  # for backwards compatibility
                 wandb.log(log_data, step=step)
