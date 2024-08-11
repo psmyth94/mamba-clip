@@ -5,6 +5,7 @@ from functools import partial
 from typing import Any
 
 import joblib
+from mamba_clip.utils.generic_utils import random_seed
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -152,10 +153,13 @@ def optuna_pipeline(args):
         mode = "maximize"
 
     args.log_local = True
-    sampler = TPESampler(seed=42, multivariate=True)
 
     args.local_rank, args.rank, args.world_size = world_info_from_env()
     args.world_size = 1
+    # so that the GPUs don't sample the same seed
+    args.seed = args.seed + args.rank
+    sampler = TPESampler(seed=args.seed, multivariate=True)
+    random_seed(args.seed)
 
     logger_setup(rank=args.rank, local_rank=args.local_rank)
     if args.optuna_study_name is not None:
