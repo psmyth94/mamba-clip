@@ -443,12 +443,12 @@ def train_test_split(data, test_size=0.2, random_state=None, stratify=None):
 
 
 def get_data(args, preprocess_train, preprocess_val, tokenizer):
-    if is_master(args) or args.hyperparameter_tuning:
+    if is_master(args):
         logger.info("Loading data...")
     # Create dataset
     test_dataset_path = args.data_path + "test-image.hdf5"
     test_metadata_path = args.data_path + "test-metadata.csv"
-    if is_master(args) or args.hyperparameter_tuning:
+    if is_master(args):
         logger.info(f"Loading test dataset from {test_dataset_path}")
     test_dataset = IsicChallengeDataset(
         data_path=test_dataset_path,
@@ -476,8 +476,8 @@ def get_data(args, preprocess_train, preprocess_val, tokenizer):
     train_metadata = pd.read_csv(train_metadata_path)
     # stratify by target
     targets = train_metadata["target"]
-    if is_master(args) or args.hyperparameter_tuning:
-        logger.info(f"Loading train dataset from {train_dataset_path}")
+    if is_master(args):
+        logger.info(f"Loding train dataset from {train_dataset_path}")
         logger.info(f"Stratifying by target: {targets.value_counts()}")
 
     train_metadata, val_metadata = train_test_split(

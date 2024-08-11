@@ -109,6 +109,9 @@ def is_local_master(args):
 
 
 def is_master(args, local=False):
+    if args.hyperparameter_tuning:
+        # in hyperparameter tuning, every rank is running independently
+        return True
     return is_local_master(args) if local else is_global_master(args)
 
 

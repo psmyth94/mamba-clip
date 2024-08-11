@@ -28,7 +28,7 @@ from mamba_clip.utils.file_utils import (
     start_sync_process,
 )
 from mamba_clip.utils.generic_utils import get_latest_checkpoint, random_seed
-from mamba_clip.utils.logging import create_log_path, get_logger
+from mamba_clip.utils.logging import create_log_path, get_logger, logger_setup
 
 try:
     import wandb
@@ -88,7 +88,11 @@ def setup_paths(args, trial_id=None):
     args.log_path = None
     if is_master(args, local=args.log_local):
         os.makedirs(args.log_base_path, exist_ok=True)
-        log_filename = f"out-{args.rank}" if args.log_local else "out.log"
+        log_filename = (
+            f"out-{args.rank}"
+            if args.log_local or args.hyperparameter_tuning
+            else "out.log"
+        )
         args.log_path = os.path.join(args.log_base_path, log_filename)
         if os.path.exists(args.log_path) and not resume_latest:
             print(
@@ -379,12 +383,7 @@ def prepare_params(model, data, device, args):
         assert tensorboard is not None, "Please install tensorboard."
         writer = tensorboard.SummaryWriter(args.tensorboard_path)
 
-    if (
-        args.wandb
-        and is_master(args)
-        and args.epochs > 0
-        and not args.hyperparameter_tuning
-    ):
+    if args.wandb and is_master(args) and args.epochs > 0:
         init_wandb(args, data, model, params_file)
 
     # Pytorch 2.0 adds '_orig_mod.' prefix to keys of state_dict() of compiled models.
@@ -508,7 +507,7 @@ def step(
                 )
                 torch.save(checkpoint_dict, tmp_save_path)
                 os.replace(tmp_save_path, latest_save_path)
-    if args.wandb and is_master(args) and not args.hyperparameter_tuning:
+    if args.wandb and is_master(args):
         wandb.finish()
 
     return metrics
@@ -518,6 +517,7 @@ def pipeline(args):
     device = init_device(args)
     args.lr *= args.world_size
 
+    logger_setup()
     metrics = None
     if args.stage == 1:
         model_stage_1, preprocess_train, preprocess_val, tokenizer = init_model(

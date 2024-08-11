@@ -438,18 +438,31 @@ def unsilence(verbosity, is_pb_enabled):
 
 # output the log to a text file
 def logger_setup(output_dir=None, log_file=None, rank=None, local_rank=None) -> None:
-    if log_file is not None:
+    if log_file is not None or rank is not None:
+        original_logger = get_logger()
         if isinstance(log_file, bool) and log_file:
             log_file = f"{datetime.datetime.now().strftime('%y-%m-%d_%h-%m-%s')}.err"
-        if not log_file.endswith(".err"):
-            log_file = Path(log_file).with_suffix(".err").name
+        elif log_file is None and sys.stderr is not None:
+            # add rank to log file name
+            log_file = Path(sys.stderr.name).stem
+            if rank is not None:
+                log_file += f"_rank_{rank}"
+            if local_rank is not None:
+                log_file += f"_local_rank_{local_rank}"
+            log_file += ".log"
+        elif not log_file.endswith(".err") or not log_file.endswith(".log"):
+            log_file = Path(log_file).with_suffix(".log").name
         log_file = os.path.join(output_dir, log_file)
         handler = logging.StreamHandler()
         sys.stderr = open(log_file, "w")
         handler.flush = sys.stderr.flush
         handler.propagate = False
         set_default_handler(handler)
-
+        if rank is not None:
+            set_verbosity_info()
+            original_logger.info(
+                f"Logging to {log_file} rank: {rank} local_rank: {local_rank}"
+            )
     set_verbosity_info()
     if rank is not None:
         header = f"[%(levelname)1.1s %(asctime)s rank: {rank} local_rank: {local_rank}]"

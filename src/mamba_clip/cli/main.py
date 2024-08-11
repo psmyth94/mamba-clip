@@ -493,7 +493,6 @@ def arg_parser():
 
 
 def main():
-    logger_setup()
     args = arg_parser()
     if args.hyperparameter_tuning:
         if args.hyperparameter_strategy == "optuna":

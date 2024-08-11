@@ -7,9 +7,15 @@ from typing import Any
 
 import numpy as np
 import optuna
-import torch
-
 import ray
+import torch
+from ray import tune
+from ray.air import CheckpointConfig, RunConfig
+from ray.air.integrations.wandb import WandbLoggerCallback
+from ray.tune.schedulers import ASHAScheduler
+from ray.tune.search.optuna import OptunaSearch
+from ray.util.joblib import register_ray
+
 from mamba_clip.data import get_data
 from mamba_clip.loss import ClipLoss, cross_entropy_loss
 from mamba_clip.model import ClipClassifier, init_model
@@ -24,12 +30,6 @@ from mamba_clip.utils.file_utils import (
     pt_load,
 )
 from mamba_clip.utils.logging import create_log_path, get_logger, logger_setup
-from ray import tune
-from ray.air import CheckpointConfig, RunConfig
-from ray.air.integrations.wandb import WandbLoggerCallback
-from ray.tune.schedulers import ASHAScheduler
-from ray.tune.search.optuna import OptunaSearch
-from ray.util.joblib import register_ray
 
 try:
     import wandb

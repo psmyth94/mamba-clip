@@ -66,7 +66,6 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
         cumulative_loss = 0.0
         all_image_features, all_text_features = [], []
         all_probs = []
-        all_zero_shot_probs = []
         all_targets = []
         with torch.inference_mode():
             for i, batch in enumerate(dataloader):
@@ -136,10 +135,12 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
                 all_targets = torch.cat(all_targets, dim=0)
                 p_auc = partial_auc(all_targets.cpu().numpy(), all_probs[:, 1].numpy())
                 metrics["partial_auc"] = p_auc
-            metrics.update({
-                "epoch": epoch,
-                "num_samples": num_samples,
-            })
+            metrics.update(
+                {
+                    "epoch": epoch,
+                    "num_samples": num_samples,
+                }
+            )
 
     if not metrics:
         return metrics
