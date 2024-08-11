@@ -11,7 +11,7 @@ import torch
 import torch.distributed as dist
 
 import optuna
-from mamba_clip.data import get_data, get_transform
+from mamba_clip.data import get_data, get_metadata, get_transform, undersample_data
 from mamba_clip.loss import cross_entropy_loss
 from mamba_clip.model import VSSM
 from mamba_clip.pipeline import (
@@ -70,7 +70,8 @@ logger = get_logger(__name__)
 def load_data(args):
     preprocess_train = get_transform(is_train=True)
     preprocess_val = get_transform(is_train=False)
-    return get_data(args, preprocess_train, preprocess_val, tokenizer=None)
+    train_metadata, val_metadata, _ = get_metadata(args)
+    return train_metadata, val_metadata, preprocess_train, preprocess_val
 
 
 def setup(args, data, device):
@@ -92,12 +93,24 @@ def setup(args, data, device):
 
 def optimize(trial: optuna.Trial, data, args) -> dict[str, Any]:
     new_args = copy.deepcopy(args)
+    train_metadata, val_metadata, preprocess_train, preprocess_val = data
     new_args.device = (
         "cuda:%d" % args.local_rank if torch.cuda.is_available() else "cpu"
     )
     torch.cuda.set_device(new_args.device)
     device = torch.device(new_args.device)
 
+    new_args.undersample = trial.suggest_int("undersample", 10000, 100000, step=10000)
+    train_metadata, val_metadata = undersample_data(
+        new_args, train_metadata, val_metadata
+    )
+    data = get_data(
+        new_args,
+        train_metadata=train_metadata,
+        val_metadata=val_metadata,
+        preprocess_train=preprocess_train,
+        preprocess_val=preprocess_val,
+    )
     new_args.epochs = trial.suggest_int("epochs", 1, 5)
     new_args.lr = trial.suggest_float("lr", 1e-6, 1e-3, log=True)
     new_args.beta1 = trial.suggest_float("beta1", 0.9, 0.999)
@@ -156,12 +169,13 @@ def optuna_pipeline(args):
 
     args.local_rank, args.rank, args.world_size = world_info_from_env()
     args.world_size = 1
+    logger_setup(rank=args.rank, local_rank=args.local_rank)
+    metadata = load_data(args)
     # so that the GPUs don't sample the same seed
+
     args.seed = args.seed + args.rank
     sampler = TPESampler(seed=args.seed, multivariate=True)
     random_seed(args.seed)
-
-    logger_setup(rank=args.rank, local_rank=args.local_rank)
     if args.optuna_study_name is not None:
         storage = None
         if args.optuna_storage is not None:
@@ -187,7 +201,7 @@ def optuna_pipeline(args):
     study.optimize(
         lambda trial: optimize(
             trial,
-            data=load_data(args),
+            data=metadata,
             args=args,
         ),
         n_trials=args.training_iterations,

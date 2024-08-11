@@ -442,154 +442,181 @@ def train_test_split(data, test_size=0.2, random_state=None, stratify=None):
     return train_data, test_data
 
 
-def get_data(args, preprocess_train, preprocess_val, tokenizer):
+def get_metadata(args):
+    test_metadata = None
+    train_metadata = None
+    val_metadata = None
+    if args.is_test:
+        test_metadata_path = args.data_path + "test-metadata.csv"
+        test_metadata = pd.read_csv(test_metadata_path)
+
+    if not args.is_test:
+        train_metadata_path = args.data_path + "train-metadata.csv"
+
+        train_metadata = pd.read_csv(train_metadata_path)
+        targets = train_metadata["target"]
+        if is_master(args):
+            logger.info(f"Stratifying by target: {targets.value_counts()}")
+
+        train_metadata, val_metadata = train_test_split(
+            train_metadata, test_size=0.2, stratify=targets, random_state=args.seed
+        )
+
+    return train_metadata, val_metadata, test_metadata
+
+
+def undersample_data(args, train_metadata, val_metadata):
+    def select_interesting_samples(tbl, n=None, col=None, sort_by=None):
+        if n is None:
+            return tbl
+        if sort_by is not None and col is not None:
+            if sort_by == "asc":
+                tbl = tbl.sort_values(col)
+            elif sort_by == "desc":
+                tbl = tbl.sort_values(col, ascending=False)
+            elif "/" in sort_by:
+                n_0_p, n_1_p = map(int, sort_by.split("/"))
+                n_0_p = n_0_p / (n_0_p + n_1_p)
+                n_0 = int(n * n_0_p)
+                n_1 = n - n_0
+                tbl = tbl.sort_values(col)
+                tbl_0 = tbl.head(n_0)
+                tbl_1 = tbl.tail(n_1)
+                return pd.concat([tbl_0, tbl_1])
+            elif sort_by == "uniform":
+                tbl = tbl.sort_values(col)
+                steps = len(tbl) // args.undersample
+                return tbl.iloc[::steps]
+            else:
+                raise ValueError(f"Unknown sort_by value: {sort_by}")
+            return tbl.head(n)
+        return tbl.sample(n=n, replace=False)
+
+    new_train_metadata = []
+    for c in train_metadata["target"].unique():
+        tbl = train_metadata[train_metadata["target"] == c]
+        n_samples = args.undersample if args.undersample < len(tbl) else None
+        new_train_metadata.append(
+            select_interesting_samples(
+                tbl,
+                n_samples,
+                col=args.undersample_by,
+                sort_by=args.undersample_sort_by,
+            )
+        )
+    new_train_metadata = pd.concat(new_train_metadata)
+    if args.add_remaining_samples:
+        index_to_add = list(
+            set(list(train_metadata.index)) - set(list(new_train_metadata.index))
+        )
+        val_metadata = pd.concat([val_metadata, train_metadata.loc[index_to_add]])
+    train_metadata = new_train_metadata
+
+    return train_metadata, val_metadata
+
+
+def get_data(
+    args,
+    train_metadata,
+    val_metadata=None,
+    test_metadata=None,
+    preprocess_train=None,
+    preprocess_val=None,
+    tokenizer=None,
+):
     if is_master(args):
         logger.info("Loading data...")
     # Create dataset
-    test_dataset_path = args.data_path + "test-image.hdf5"
-    test_metadata_path = args.data_path + "test-metadata.csv"
-    if is_master(args):
-        logger.info(f"Loading test dataset from {test_dataset_path}")
-    test_dataset = IsicChallengeDataset(
-        data_path=test_dataset_path,
-        metadata_or_path=test_metadata_path,
-        tokenizer=tokenizer,
-        transform=preprocess_val,
-        is_train=False,
-    )
-    num_test_samples = len(test_dataset)
+    data = {}
+    if test_metadata is not None:
+        test_dataset_path = args.data_path + "test-image.hdf5"
+        test_metadata_path = args.data_path + "test-metadata.csv"
+        if is_master(args):
+            logger.info(f"Loading test dataset from {test_dataset_path}")
+        test_dataset = IsicChallengeDataset(
+            data_path=test_dataset_path,
+            metadata_or_path=test_metadata_path,
+            tokenizer=tokenizer,
+            transform=preprocess_val,
+            is_train=False,
+        )
+        num_test_samples = len(test_dataset)
 
-    test_data_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        pin_memory=True,
-        num_workers=args.workers,
-        drop_last=False,
-    )
-    test_data_loader.num_samples = num_test_samples
-    test_data_loader.num_batches = len(test_data_loader)
+        test_data_loader = DataLoader(
+            test_dataset,
+            batch_size=args.batch_size,
+            pin_memory=True,
+            num_workers=args.workers,
+            drop_last=False,
+        )
+        test_data_loader.num_samples = num_test_samples
+        test_data_loader.num_batches = len(test_data_loader)
 
-    test_data = DataInfo(test_data_loader)
+        data["test"] = DataInfo(test_data_loader)
 
-    train_dataset_path = args.data_path + "train-image/image"
-    train_metadata_path = args.data_path + "train-metadata.csv"
-    train_metadata = pd.read_csv(train_metadata_path)
-    # stratify by target
-    targets = train_metadata["target"]
-    if is_master(args):
-        logger.info(f"Loding train dataset from {train_dataset_path}")
-        logger.info(f"Stratifying by target: {targets.value_counts()}")
+    if train_metadata is not None:
+        # stratify by target
+        targets = train_metadata["target"]
 
-    train_metadata, val_metadata = train_test_split(
-        train_metadata, test_size=0.2, stratify=targets, random_state=args.seed
-    )
-    if args.undersample:
-
-        def select_interesting_samples(tbl, n=None, col=None, sort_by=None):
-            if n is None:
-                return tbl
-            if sort_by is not None and col is not None:
-                if sort_by == "asc":
-                    tbl = tbl.sort_values(col)
-                elif sort_by == "desc":
-                    tbl = tbl.sort_values(col, ascending=False)
-                elif "/" in sort_by:
-                    n_0_p, n_1_p = map(int, sort_by.split("/"))
-                    n_0_p = n_0_p / (n_0_p + n_1_p)
-                    n_0 = int(n * n_0_p)
-                    n_1 = n - n_0
-                    tbl = tbl.sort_values(col)
-                    tbl_0 = tbl.head(n_0)
-                    tbl_1 = tbl.tail(n_1)
-                    return pd.concat([tbl_0, tbl_1])
-                elif sort_by == "uniform":
-                    tbl = tbl.sort_values(col)
-                    steps = len(tbl) // args.undersample
-                    return tbl.iloc[::steps]
-                else:
-                    raise ValueError(f"Unknown sort_by value: {sort_by}")
-                return tbl.head(n)
-            return tbl.sample(n=n, replace=False)
-
-        new_train_metadata = []
-        for c in train_metadata["target"].unique():
-            tbl = train_metadata[train_metadata["target"] == c]
-            n_samples = args.undersample if args.undersample < len(tbl) else None
-            new_train_metadata.append(
-                select_interesting_samples(
-                    tbl,
-                    n_samples,
-                    col=args.undersample_by,
-                    sort_by=args.undersample_sort_by,
-                )
+        if isinstance(args.class_weighted_loss, bool) and args.class_weighted_loss:
+            args.class_weighted_loss = compute_class_weight(
+                "balanced", classes=np.unique(targets), y=targets
             )
-        new_train_metadata = pd.concat(new_train_metadata)
-        if args.add_remaining_samples:
-            index_to_add = list(
-                set(list(train_metadata.index)) - set(list(new_train_metadata.index))
-            )
-            val_metadata = pd.concat([val_metadata, train_metadata.loc[index_to_add]])
-        train_metadata = new_train_metadata
-    if isinstance(args.class_weighted_loss, bool) and args.class_weighted_loss:
-        args.class_weighted_loss = compute_class_weight(
-            "balanced", classes=np.unique(targets), y=targets
+        train_dataset_path = args.data_path + "train-image/image"
+        train_dataset = IsicChallengeDataset(
+            data_path=train_dataset_path,
+            metadata_or_path=train_metadata,
+            tokenizer=tokenizer,
+            transform=preprocess_train,
+            is_train=True,
+            include_target=args.stage == 1,
+            small_test=args.small_test,
+        )
+        num_train_samples = len(train_dataset)
+        train_sampler = None
+        if args.distributed:
+            train_sampler = DistributedSampler(train_dataset)
+        shuffle = not args.distributed
+        train_data_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=shuffle,
+            sampler=train_sampler,
+            pin_memory=True,
+            num_workers=args.workers,
+            drop_last=True,
+        )
+        train_data_loader.num_samples = num_train_samples
+        train_data_loader.num_batches = len(train_data_loader)
+
+        data["train"] = DataInfo(train_data_loader)
+
+    if val_metadata is not None:
+        val_dataset_path = args.data_path + "train-image/image"
+        val_dataset = IsicChallengeDataset(
+            data_path=val_dataset_path,
+            metadata_or_path=val_metadata,
+            tokenizer=tokenizer,
+            transform=preprocess_val,
+            is_train=False,
+            include_target=args.stage == 1,
+            small_test=args.small_test,
         )
 
-    train_dataset = IsicChallengeDataset(
-        data_path=train_dataset_path,
-        metadata_or_path=train_metadata,
-        tokenizer=tokenizer,
-        transform=preprocess_train,
-        is_train=True,
-        include_target=args.stage == 1,
-        small_test=args.small_test,
-    )
+        num_val_samples = len(val_dataset)
 
-    val_dataset = IsicChallengeDataset(
-        data_path=train_dataset_path,
-        metadata_or_path=val_metadata,
-        tokenizer=tokenizer,
-        transform=preprocess_val,
-        is_train=False,
-        include_target=args.stage == 1,
-        small_test=args.small_test,
-    )
+        num_val_samples = len(val_dataset)
 
-    num_train_samples = len(train_dataset)
-    num_val_samples = len(val_dataset)
+        val_data_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            pin_memory=True,
+            num_workers=args.workers,
+            drop_last=False,
+        )
+        val_data_loader.num_samples = num_val_samples
+        val_data_loader.num_batches = len(val_data_loader)
 
-    train_sampler = None
-    if args.distributed:
-        train_sampler = DistributedSampler(train_dataset)
-    shuffle = not args.distributed
-    train_data_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=shuffle,
-        sampler=train_sampler,
-        pin_memory=True,
-        num_workers=args.workers,
-        drop_last=True,
-    )
-    train_data_loader.num_samples = num_train_samples
-    train_data_loader.num_batches = len(train_data_loader)
+        data["val"] = DataInfo(val_data_loader)
 
-    train_data = DataInfo(train_data_loader)
-
-    num_val_samples = len(val_dataset)
-
-    val_data_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        pin_memory=True,
-        num_workers=args.workers,
-        drop_last=False,
-    )
-    val_data_loader.num_samples = num_val_samples
-    val_data_loader.num_batches = len(val_data_loader)
-
-    val_data = DataInfo(val_data_loader)
-
-    data = {"train": train_data, "val": val_data}
     return data

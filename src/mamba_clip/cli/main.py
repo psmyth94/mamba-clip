@@ -108,6 +108,7 @@ class Args:
     use_bnb_linear: Optional[str] = None
     siglip: bool = False
     small_test: bool = False
+    is_test: bool = False
 
     rank: int = 0
     local_rank: int = 0
@@ -487,6 +488,7 @@ def arg_parser():
     parser.add_argument(
         "--small-test", action="store_true", help="Use small dataset for debugging"
     )
+    parser.add_argument("--is-test", action="store_true", help="Test only mode")
 
     args = parser.parse_args()
     return Args(**vars(args))
