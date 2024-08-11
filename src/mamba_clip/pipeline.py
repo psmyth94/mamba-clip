@@ -43,6 +43,28 @@ except ImportError:
 logger = get_logger(__name__)
 
 
+def init_wandb(args, data, model, params_file):
+    assert wandb is not None, "Please install wandb."
+    logger.debug("Starting wandb.")
+    args.train_sz = data["train"].dataloader.num_samples
+    if args.val_data_path is not None or "val" in data:
+        args.val_sz = data["val"].dataloader.num_samples
+    # you will have to configure this for your project!
+    wandb.init(
+        project=args.wandb_project_name,
+        name=args.name,
+        id=args.name,
+        notes=args.wandb_notes,
+        tags=[],
+        resume="auto" if args.resume == "latest" else None,
+        config=vars(args),
+    )
+    if args.debug:
+        wandb.watch(model, log="all")
+    wandb.save(params_file)
+    logger.debug("Finished loading wandb.")
+
+
 def setup_paths(args, trial_id=None):
     # get the name of the experiments
     if args.stage == 1:
@@ -361,25 +383,7 @@ def prepare_params(model, data, device, args):
         and args.epochs > 0
         and not args.hyperparameter_tuning
     ):
-        assert wandb is not None, "Please install wandb."
-        logger.debug("Starting wandb.")
-        args.train_sz = data["train"].dataloader.num_samples
-        if args.val_data_path is not None or "val" in data:
-            args.val_sz = data["val"].dataloader.num_samples
-        # you will have to configure this for your project!
-        wandb.init(
-            project=args.wandb_project_name,
-            name=args.name,
-            id=args.name,
-            notes=args.wandb_notes,
-            tags=[],
-            resume="auto" if args.resume == "latest" else None,
-            config=vars(args),
-        )
-        if args.debug:
-            wandb.watch(model, log="all")
-        wandb.save(params_file)
-        logger.debug("Finished loading wandb.")
+        init_wandb(args, data, model, params_file)
 
     # Pytorch 2.0 adds '_orig_mod.' prefix to keys of state_dict() of compiled models.
     # For compatibility, we save state_dict() of the original model, which shares the

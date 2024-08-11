@@ -13,7 +13,13 @@ import optuna
 from mamba_clip.data import get_data, get_transform
 from mamba_clip.loss import cross_entropy_loss
 from mamba_clip.model import VSSM
-from mamba_clip.pipeline import prepare_params, setup_paths, setup_train, step
+from mamba_clip.pipeline import (
+    init_wandb,
+    prepare_params,
+    setup_paths,
+    setup_train,
+    step,
+)
 from mamba_clip.utils.dist_utils import (
     broadcast_object,
     init_device,
@@ -85,10 +91,11 @@ def setup(args, data, device):
 
 def optimize(trial: optuna.Trial, data, args) -> dict[str, Any]:
     new_args = copy.deepcopy(args)
-    new_args.device = "cuda:%d" % args.local_rank if torch.cuda.is_available() else "cpu"
+    new_args.device = (
+        "cuda:%d" % args.local_rank if torch.cuda.is_available() else "cpu"
+    )
     torch.cuda.set_device(new_args.device)
     device = torch.device(new_args.device)
-
 
     new_args.epochs = trial.suggest_int("epochs", 1, 5)
     new_args.lr = trial.suggest_float("lr", 1e-6, 1e-3, log=True)
@@ -110,7 +117,10 @@ def optimize(trial: optuna.Trial, data, args) -> dict[str, Any]:
 
     new_args = setup_paths(new_args, trial_id=trial.number)
     new_args = setup_train(new_args, checkpoint_prefix=f"stage_{new_args.stage}_")
+
+    params_file = os.path.join(new_args.logs, new_args.name, "params.txt")
     new_args, params = setup(new_args, data, device)
+    init_wandb(new_args, data, params["model"], params_file)
 
     metrics = step(
         data=data,
