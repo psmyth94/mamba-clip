@@ -43,7 +43,7 @@ except ImportError:
 logger = get_logger(__name__)
 
 
-def setup_paths(args):
+def setup_paths(args, trial_id=None):
     # get the name of the experiments
     if args.stage == 1:
         args.model = (
@@ -58,7 +58,7 @@ def setup_paths(args):
             else args.model_stage_2.__name__
         )
     if args.name is None:
-        args.name = create_log_path(args, args.model)
+        args.name = create_log_path(args, args.model, trial_id=trial_id)
     resume_latest = args.resume == "latest"
     args.log_base_path = os.path.join(args.logs, args.name)
     args.log_path = None

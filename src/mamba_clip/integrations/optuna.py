@@ -85,32 +85,29 @@ def setup(args, data, device):
 
 def optimize(trial: optuna.Trial, data, args) -> dict[str, Any]:
     new_args = copy.deepcopy(args)
-    device = init_device(new_args)
-    model_params = {}
-    if is_master(new_args):
-        model_params["epochs"] = trial.suggest_int("epochs", 1, 5)
-        model_params["lr"] = trial.suggest_float("lr", 1e-6, 1e-3, log=True)
-        model_params["beta1"] = trial.suggest_float("beta1", 0.9, 0.999)
-        model_params["beta2"] = trial.suggest_float("beta2", 0.9, 0.999)
-        model_params["eps"] = trial.suggest_float("eps", 1e-9, 1e-7, log=True)
-        model_params["wd"] = trial.suggest_float("wd", 1e-4, 1e-1, log=True)
-        model_params["warmup"] = trial.suggest_float("warmup", 0, 1)
-        model_params["lr_scheduler"] = "cosine"
-        model_params["lr_restart_interval"] = trial.suggest_categorical(
-            "lr_restart_interval", [1, None]
-        )
-        model_params["batch_size"] = trial.suggest_categorical(
-            "batch_size", [8, 16, 32, 64, 128, 256]
-        )
-        model_params["accum_freq"] = 1
-        model_params["grad_clip_norm"] = trial.suggest_float(
-            "grad_clip_norm", 1e-2, 1e2, log=True
-        )
-        model_params["balanced_mixup"] = trial.suggest_float("balanced_mixup", 0.0, 1.0)
-    if args.distributed:
-        model_params = broadcast_object(new_args, model_params, src=0)
-        for k, v in model_params.items():
-            setattr(new_args, k, v)
+    if os.environ.get("LOCAL_RANK") is not None:
+        device = torch.device(f"cuda:{os.environ.get('LOCAL_RANK')}")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    new_args.epochs = trial.suggest_int("epochs", 1, 5)
+    new_args.lr = trial.suggest_float("lr", 1e-6, 1e-3, log=True)
+    new_args.beta1 = trial.suggest_float("beta1", 0.9, 0.999)
+    new_args.beta2 = trial.suggest_float("beta2", 0.9, 0.999)
+    new_args.eps = trial.suggest_float("eps", 1e-9, 1e-7, log=True)
+    new_args.wd = trial.suggest_float("wd", 1e-4, 1e-1, log=True)
+    new_args.warmup = trial.suggest_float("warmup", 0, 1)
+    new_args.lr_scheduler = "cosine"
+    new_args.lr_restart_interval = trial.suggest_categorical(
+        "lr_restart_interval", [1, None]
+    )
+    new_args.batch_size = trial.suggest_categorical(
+        "batch_size", [8, 16, 32, 64, 128, 256]
+    )
+    new_args.accum_freq = 1
+    new_args.grad_clip_norm = trial.suggest_float("grad_clip_norm", 1e-2, 1e2, log=True)
+    new_args.balanced_mixup = trial.suggest_float("balanced_mixup", 0.0, 1.0)
+
     new_args = setup_paths(new_args)
     new_args = setup_train(new_args, checkpoint_prefix=f"stage_{new_args.stage}_")
     new_args, params = setup(new_args, data, device)
@@ -128,9 +125,9 @@ def optimize(trial: optuna.Trial, data, args) -> dict[str, Any]:
         args=new_args,
         save_prefix=f"stage_{new_args.stage}_",
     )
-    if args.distributed:
-        dist.barrier()
-        dist.destroy_process_group()
+    # if args.distributed:
+    #     dist.barrier()
+    #     dist.destroy_process_group()
     del params
     return metrics[new_args.eval_loss]
 
@@ -142,8 +139,7 @@ def optuna_pipeline(args):
     elif args.eval_loss in ["partial_auc", "auc", "acc"]:
         mode = "maximize"
 
-    _, global_rank, _ = world_info_from_env()
-
+    args.log_local = True
     sampler = TPESampler(seed=42, multivariate=True)
     if args.optuna_study_name is not None:
         storage = None
@@ -171,6 +167,7 @@ def optuna_pipeline(args):
         lambda trial: optimize(
             trial,
             data=load_data(args),
+            args=args,
         ),
         n_trials=args.training_iterations,
     )

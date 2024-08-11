@@ -476,7 +476,7 @@ def _color_supported() -> bool:
         return True
 
 
-def create_log_path(args, model, latest=False):
+def create_log_path(args, model, latest=False, trial_id=None):
     # sanitize model name for filesystem / uri use, easier if we don't use / in name as a rule?
     model_name_safe = model.replace("/", "-")
     date_str = datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
@@ -484,14 +484,17 @@ def create_log_path(args, model, latest=False):
         if args.distributed:
             # sync date_str from master to all ranks
             date_str = broadcast_object(args, date_str)
-        return "-".join([
+        str_id = [
             date_str,
             f"model_{model_name_safe}",
             f"lr_{args.lr}",
             f"b_{args.batch_size}",
             f"j_{args.workers}",
             f"p_{args.precision}",
-        ])
+        ]
+        if trial_id is not None:
+            str_id.append(f"trial_{trial_id}")
+        return "-".join(str_id)
     else:
         logs = []
         for f in os.listdir(args.logs):
