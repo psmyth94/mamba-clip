@@ -122,6 +122,7 @@ def optimize(trial: optuna.Trial, data, args) -> dict[str, Any]:
         scaler=params["scaler"],
         scheduler=params["scheduler"],
         start_epoch=params["start_epoch"],
+        writer=params.get("writer", None),
         args=new_args,
         save_prefix=f"stage_{new_args.stage}_",
     )
