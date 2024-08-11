@@ -6,13 +6,10 @@ from typing import Any
 
 import joblib
 import numpy as np
-import optuna
 import torch
 import torch.distributed as dist
-from optuna.samplers import TPESampler
-from optuna.storages import JournalRedisStorage, RDBStorage
-from optuna.study.study import create_study, load_study
 
+import optuna
 from mamba_clip.data import get_data, get_transform
 from mamba_clip.loss import cross_entropy_loss
 from mamba_clip.model import VSSM
@@ -24,6 +21,9 @@ from mamba_clip.utils.dist_utils import (
     world_info_from_env,
 )
 from mamba_clip.utils.logging import get_logger
+from optuna.samplers import TPESampler
+from optuna.storages import JournalRedisStorage, RDBStorage
+from optuna.study.study import create_study, load_study
 
 try:
     from optuna.storages import RedisStorage  # optuna<=3.0.0
@@ -143,23 +143,17 @@ def optuna_pipeline(args):
                 storage = JournalRedisStorage(url=args.optuna_storage)
             else:
                 storage = RDBStorage(url=args.optuna_storage)
-        # check if study exists
-        if args.optuna_study_name in optuna.study.get_all_study_summaries():
-            study = load_study(
-                study_name=args.optuna_study_name,
-                direction=mode,
-                sampler=sampler,
-                storage=storage,
-            )
-        else:
-            study = create_study(
-                direction=mode,
-                study_name=args.optuna_study_name,
-                sampler=sampler,
-                storage=storage,
-            )
+        study = create_study(
+            direction=mode,
+            study_name=args.optuna_study_name,
+            sampler=sampler,
+            storage=storage,
+            load_if_exists=True,
+        )
     else:
-        study = create_study(direction=mode, study_name="AutoTrain", sampler=sampler)
+        study = create_study(
+            direction=mode, study_name="AutoTrain", sampler=sampler, load_if_exists=True
+        )
 
     study.optimize(
         lambda trial: optimize(
