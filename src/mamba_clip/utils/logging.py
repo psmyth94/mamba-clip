@@ -442,7 +442,7 @@ def logger_setup(output_dir=None, log_file=None, rank=None, local_rank=None) -> 
         original_logger = get_logger()
         if isinstance(log_file, bool) and log_file:
             log_file = f"{datetime.datetime.now().strftime('%y-%m-%d_%h-%m-%s')}.err"
-        elif log_file is None and sys.stderr is not None:
+        elif log_file is None:
             if "SBATCH_ERROR" in os.environ:
                 log_file = os.environ["SBATCH_ERROR"]
             elif "SBATCH_OUTPUT" in os.environ:
