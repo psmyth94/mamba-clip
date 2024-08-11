@@ -444,27 +444,40 @@ def logger_setup(output_dir=None, log_file=None, rank=None, local_rank=None) -> 
             log_file = f"{datetime.datetime.now().strftime('%y-%m-%d_%h-%m-%s')}.err"
         elif log_file is None and sys.stderr is not None:
             # add rank to log file name
-            log_file = Path(sys.stderr.name).stem
-            if output_dir is None:
-                output_dir = os.path.dirname(sys.stderr.name)
-            if rank is not None:
-                log_file += f"_rank_{rank}"
-            if local_rank is not None:
-                log_file += f"_local_rank_{local_rank}"
-            log_file += ".log"
+            if not sys.stderr.isatty():
+                log_file = sys.stderr.name
+            else:
+                # get the environment variable for the log file from SLURM
+                if "SBATCH_ERROR" in os.environ:
+                    log_file = os.environ["SBATCH_ERROR"]
+                elif "SBATCH_OUTPUT" in os.environ:
+                    log_file = os.environ["SBATCH_OUTPUT"]
+                else:
+                    log_file = None
+            if log_file is not None:
+                if output_dir is None:
+                    output_dir = Path(log_file).parent
+                log_file = Path(log_file).stem
+                if rank is not None:
+                    log_file = f"{log_file}_rank_{rank}"
+                if local_rank is not None:
+                    log_file = f"{log_file}_local_rank_{local_rank}"
+                log_file = f"{log_file}.log"
         elif not log_file.endswith(".err") or not log_file.endswith(".log"):
             log_file = Path(log_file).with_suffix(".log").name
-        log_file = os.path.join(output_dir, log_file)
-        handler = logging.StreamHandler()
-        sys.stderr = open(log_file, "w")
-        handler.flush = sys.stderr.flush
-        handler.propagate = False
-        set_default_handler(handler)
-        if rank is not None:
-            set_verbosity_info()
-            original_logger.info(
-                f"Logging to {log_file} rank: {rank} local_rank: {local_rank}"
-            )
+
+        if log_file is not None:
+            if rank is not None:
+                set_verbosity_info()
+                original_logger.info(
+                    f"Logging to {log_file} rank: {rank} local_rank: {local_rank}"
+                )
+            log_file = os.path.join(output_dir, log_file)
+            handler = logging.StreamHandler()
+            sys.stderr = open(log_file, "w")
+            handler.flush = sys.stderr.flush
+            handler.propagate = False
+            set_default_handler(handler)
     set_verbosity_info()
     if rank is not None:
         header = f"[%(levelname)1.1s %(asctime)s rank: {rank} local_rank: {local_rank}]"
