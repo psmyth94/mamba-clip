@@ -108,7 +108,7 @@ def optimize(trial: optuna.Trial, data, args) -> dict[str, Any]:
     new_args.grad_clip_norm = trial.suggest_float("grad_clip_norm", 1e-2, 1e2, log=True)
     new_args.balanced_mixup = trial.suggest_float("balanced_mixup", 0.0, 1.0)
 
-    new_args = setup_paths(new_args)
+    new_args = setup_paths(new_args, trial_id=trial.number)
     new_args = setup_train(new_args, checkpoint_prefix=f"stage_{new_args.stage}_")
     new_args, params = setup(new_args, data, device)
 
