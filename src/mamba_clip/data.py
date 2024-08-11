@@ -524,8 +524,6 @@ def get_data(
     preprocess_val=None,
     tokenizer=None,
 ):
-    if is_master(args):
-        logger.info("Loading data...")
     # Create dataset
     data = {}
     if test_metadata is not None:

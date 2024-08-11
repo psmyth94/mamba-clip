@@ -101,13 +101,13 @@ def optimize(trial: optuna.Trial, data, args) -> dict[str, Any]:
     device = torch.device(new_args.device)
 
     new_args.undersample = trial.suggest_int("undersample", 10000, 100000, step=10000)
-    train_metadata, val_metadata = undersample_data(
+    train_metadata_trial, val_metadata_trial = undersample_data(
         new_args, train_metadata, val_metadata
     )
     data = get_data(
         new_args,
-        train_metadata=train_metadata,
-        val_metadata=val_metadata,
+        train_metadata=train_metadata_trial,
+        val_metadata=val_metadata_trial,
         preprocess_train=preprocess_train,
         preprocess_val=preprocess_val,
     )
