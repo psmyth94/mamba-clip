@@ -2,7 +2,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="mamba-clip",
-    version="0.1.3.dev32",
+    version="0.1.3.dev33",
     description="A package for training mamba vision model and text encoder using CLIP",
     author_email="psmyth1994@gmail.com",
     license="Apache 2.0",

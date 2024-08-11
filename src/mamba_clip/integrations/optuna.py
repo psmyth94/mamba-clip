@@ -117,7 +117,7 @@ def optimize(trial: optuna.Trial, data, args) -> dict[str, Any]:
         loss=params["loss"],
         model=params["model"],
         original_model=params["original_model"],
-        tokenizer=params["tokenizer"],
+        tokenizer=params.get("tokenizer", None),
         optimizer=params["optimizer"],
         scaler=params["scaler"],
         scheduler=params["scheduler"],
