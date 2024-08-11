@@ -437,7 +437,7 @@ def unsilence(verbosity, is_pb_enabled):
 
 
 # output the log to a text file
-def logger_setup(output_dir=None, log_file=None):
+def logger_setup(output_dir=None, log_file=None, rank=None, local_rank=None) -> None:
     if log_file is not None:
         if isinstance(log_file, bool) and log_file:
             log_file = f"{datetime.datetime.now().strftime('%y-%m-%d_%h-%m-%s')}.err"
@@ -451,7 +451,10 @@ def logger_setup(output_dir=None, log_file=None):
         set_default_handler(handler)
 
     set_verbosity_info()
-    header = "[%(levelname)1.1s %(asctime)s]"
+    if rank is not None:
+        header = f"[%(levelname)1.1s %(asctime)s rank: {rank} local_rank: {local_rank}]"
+    else:
+        header = "[%(levelname)1.1s %(asctime)s]"
     message = "%(message)s"
     if _color_supported():
         import colorlog
