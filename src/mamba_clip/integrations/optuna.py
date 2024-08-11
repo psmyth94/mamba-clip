@@ -23,20 +23,29 @@ from mamba_clip.utils.dist_utils import (
 from mamba_clip.utils.logging import get_logger
 from optuna.samplers import TPESampler
 from optuna.storages import JournalRedisStorage, RDBStorage
-from optuna.study.study import create_study, load_study
+from optuna.study.study import create_study
 
 try:
     from optuna.storages import RedisStorage  # optuna<=3.0.0
+
+    JournalRedisStorage = None
 except ImportError:
     try:
         from optuna.storages import (
-            JournalRedisStorage as RedisStorage,  # optuna>=3.1.0,<4.0.0
+            JournalRedisStorage,  # optuna>=3.1.0,<4.0.0
+            JournalStorage as RedisStorage,
         )
+
     except ImportError:
         try:
-            from optuna.storages.journal import JournalRedisBackend as RedisStorage
+            from optuna.storages.journal import (
+                JournalRedisBackend as JournalRedisStorage,
+            )
+            from optuna.storages import JournalStorage as RedisStorage
+
         except ImportError:
             RedisStorage = None
+            JournalRedisStorage = None
 
 try:
     import wandb
@@ -137,17 +146,20 @@ def optuna_pipeline(args):
 
     sampler = TPESampler(seed=42, multivariate=True)
     if args.optuna_study_name is not None:
-        # storage = None
-        # if args.optuna_storage is not None:
-        #     if args.optuna_storage.startswith("redis"):
-        #         storage = JournalRedisStorage(url=args.optuna_storage)
-        #     else:
-        #         storage = RDBStorage(url=args.optuna_storage)
+        storage = None
+        if args.optuna_storage is not None:
+            if args.optuna_storage.startswith("redis"):
+                if JournalRedisStorage is not None:
+                    storage = RedisStorage(JournalRedisStorage(url=args.optuna_storage))
+                else:
+                    storage = RedisStorage(url=args.optuna_storage)
+            else:
+                storage = RDBStorage(url=args.optuna_storage)
         study = create_study(
             direction=mode,
             study_name=args.optuna_study_name,
             sampler=sampler,
-            storage=args.optuna_storage,
+            storage=storage,
             load_if_exists=True,
         )
     else:
