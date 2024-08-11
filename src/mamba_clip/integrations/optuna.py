@@ -6,10 +6,13 @@ from typing import Any
 
 import joblib
 import numpy as np
+import optuna
 import torch
 import torch.distributed as dist
+from optuna.samplers import TPESampler
+from optuna.storages import JournalRedisStorage, RDBStorage
+from optuna.study.study import create_study, load_study
 
-import optuna
 from mamba_clip.data import get_data, get_transform
 from mamba_clip.loss import cross_entropy_loss
 from mamba_clip.model import VSSM
@@ -21,9 +24,19 @@ from mamba_clip.utils.dist_utils import (
     world_info_from_env,
 )
 from mamba_clip.utils.logging import get_logger
-from optuna.samplers import TPESampler
-from optuna.storages import RDBStorage, RedisStorage
-from optuna.study.study import create_study, load_study
+
+try:
+    from optuna.storages import RedisStorage  # optuna<=3.0.0
+except ImportError:
+    try:
+        from optuna.storages import (
+            JournalRedisStorage as RedisStorage,  # optuna>=3.1.0,<4.0.0
+        )
+    except ImportError:
+        try:
+            from optuna.storages.journal import JournalRedisBackend as RedisStorage
+        except ImportError:
+            RedisStorage = None
 
 try:
     import wandb
@@ -127,7 +140,7 @@ def optuna_pipeline(args):
         storage = None
         if args.optuna_storage is not None:
             if args.optuna_storage.startswith("redis"):
-                storage = RedisStorage(url=args.optuna_storage)
+                storage = JournalRedisStorage(url=args.optuna_storage)
             else:
                 storage = RDBStorage(url=args.optuna_storage)
         # check if study exists
