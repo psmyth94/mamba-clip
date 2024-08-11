@@ -137,17 +137,17 @@ def optuna_pipeline(args):
 
     sampler = TPESampler(seed=42, multivariate=True)
     if args.optuna_study_name is not None:
-        storage = None
-        if args.optuna_storage is not None:
-            if args.optuna_storage.startswith("redis"):
-                storage = JournalRedisStorage(url=args.optuna_storage)
-            else:
-                storage = RDBStorage(url=args.optuna_storage)
+        # storage = None
+        # if args.optuna_storage is not None:
+        #     if args.optuna_storage.startswith("redis"):
+        #         storage = JournalRedisStorage(url=args.optuna_storage)
+        #     else:
+        #         storage = RDBStorage(url=args.optuna_storage)
         study = create_study(
             direction=mode,
             study_name=args.optuna_study_name,
             sampler=sampler,
-            storage=storage,
+            storage=args.optuna_storage,
             load_if_exists=True,
         )
     else:
