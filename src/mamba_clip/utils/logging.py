@@ -443,17 +443,12 @@ def logger_setup(output_dir=None, log_file=None, rank=None, local_rank=None) -> 
         if isinstance(log_file, bool) and log_file:
             log_file = f"{datetime.datetime.now().strftime('%y-%m-%d_%h-%m-%s')}.err"
         elif log_file is None and sys.stderr is not None:
-            # add rank to log file name
-            if not sys.stderr.isatty():
-                log_file = sys.stderr.name
+            if "SBATCH_ERROR" in os.environ:
+                log_file = os.environ["SBATCH_ERROR"]
+            elif "SBATCH_OUTPUT" in os.environ:
+                log_file = os.environ["SBATCH_OUTPUT"]
             else:
-                # get the environment variable for the log file from SLURM
-                if "SBATCH_ERROR" in os.environ:
-                    log_file = os.environ["SBATCH_ERROR"]
-                elif "SBATCH_OUTPUT" in os.environ:
-                    log_file = os.environ["SBATCH_OUTPUT"]
-                else:
-                    log_file = None
+                log_file = None
             if log_file is not None:
                 if output_dir is None:
                     output_dir = Path(log_file).parent
