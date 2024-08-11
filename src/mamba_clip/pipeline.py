@@ -81,6 +81,8 @@ def setup_paths(args, trial_id=None):
         )
     if args.name is None:
         args.name = create_log_path(args, args.model, trial_id=trial_id)
+    elif trial_id is not None:
+        args.name = f"{args.name}_trial_{trial_id}"
     resume_latest = args.resume == "latest"
     args.log_base_path = os.path.join(args.logs, args.name)
     args.log_path = None

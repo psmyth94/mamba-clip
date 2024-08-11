@@ -120,7 +120,8 @@ def optimize(trial: optuna.Trial, data, args) -> dict[str, Any]:
 
     params_file = os.path.join(new_args.logs, new_args.name, "params.txt")
     new_args, params = setup(new_args, data, device)
-    init_wandb(new_args, data, params["model"], params_file)
+    if new_args.wandb:
+        init_wandb(new_args, data, params["model"], params_file)
 
     metrics = step(
         data=data,
