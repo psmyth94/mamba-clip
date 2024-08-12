@@ -1,7 +1,7 @@
 # type: ignore
 import math
 from functools import partial
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Sequence
 
 import numpy as np
 import torch
@@ -18,6 +18,7 @@ from timm.layers.drop import DropPath
 from torch.functional import Tensor
 from torch.nn.init import trunc_normal_
 from torch.utils import checkpoint
+from transformers import PreTrainedModel
 
 from .data import get_transform
 from .utils import logging
@@ -751,16 +752,20 @@ class VSSLayer(torch.nn.Module):
         self.dim = dim
         self.use_checkpoint = use_checkpoint
 
-        self.blocks = torch.nn.ModuleList([
-            SS_Conv_SSM(
-                hidden_dim=dim,
-                drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-                norm_layer=norm_layer,
-                attn_drop_rate=attn_drop,
-                d_state=d_state,
-            )
-            for i in range(depth)
-        ])
+        self.blocks = torch.nn.ModuleList(
+            [
+                SS_Conv_SSM(
+                    hidden_dim=dim,
+                    drop_path=drop_path[i]
+                    if isinstance(drop_path, list)
+                    else drop_path,
+                    norm_layer=norm_layer,
+                    attn_drop_rate=attn_drop,
+                    d_state=d_state,
+                )
+                for i in range(depth)
+            ]
+        )
 
         if True:  # is this really applied? Yes, but been overriden later in VSSM!
 
@@ -819,16 +824,20 @@ class VSSLayer_up(torch.nn.Module):
         self.dim = dim
         self.use_checkpoint = use_checkpoint
 
-        self.blocks = torch.nn.ModuleList([
-            SS_Conv_SSM(
-                hidden_dim=dim,
-                drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-                norm_layer=norm_layer,
-                attn_drop_rate=attn_drop,
-                d_state=d_state,
-            )
-            for i in range(depth)
-        ])
+        self.blocks = torch.nn.ModuleList(
+            [
+                SS_Conv_SSM(
+                    hidden_dim=dim,
+                    drop_path=drop_path[i]
+                    if isinstance(drop_path, list)
+                    else drop_path,
+                    norm_layer=norm_layer,
+                    attn_drop_rate=attn_drop,
+                    d_state=d_state,
+                )
+                for i in range(depth)
+            ]
+        )
 
         if True:  # is this really applied? Yes, but been overriden later in VSSM!
 
@@ -1194,6 +1203,55 @@ class ClipClassifier(torch.nn.Module):
         probabilities = F.softmax(logits, dim=1)
         predicted_class = torch.argmax(probabilities, dim=1)
         return predicted_class, probabilities
+
+
+class MambaVisionClassifier(torch.nn.Module):
+    def __init__(
+        self,
+        model: PreTrainedModel,
+        num_classes: int = 2,
+        dropout=0.1,
+    ):
+        super().__init__()
+        self.model = unwrap_model(model)
+        self.num_classes = num_classes
+        self.config = self.model.config
+
+        feature_dim = int(
+            self.model.config.dim * 2 ** (len(self.model.config.depths) - 1)
+        )
+
+        self.fc = torch.nn.Sequential(
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(feature_dim, num_classes),
+        )
+
+    def forward(self, image, *args, **kwargs):
+        out = self.model(image)
+        if isinstance(out, tuple):
+            out = out[0]
+        elif isinstance(out, dict):
+            out = next(iter(out.values()))
+        return self.fc(out)
+
+    def lock_image_tower(self, unlocked_groups=0, freeze_bn_stats=False):
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+        if unlocked_groups != 0:
+
+            def _unlock(x):
+                if isinstance(x, Sequence):
+                    for g in x:
+                        _unlock(g)
+                else:
+                    if isinstance(x, torch.nn.Parameter):
+                        x.requires_grad = True
+                    else:
+                        for p in x.parameters():
+                            p.requires_grad = True
+
+            _unlock(self.model.levels[-unlocked_groups:])
 
 
 def init_model(

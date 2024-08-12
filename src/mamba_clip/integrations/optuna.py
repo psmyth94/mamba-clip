@@ -5,15 +5,18 @@ from functools import partial
 from typing import Any
 
 import joblib
-from mamba_clip.utils.generic_utils import random_seed
 import numpy as np
-import torch
-import torch.distributed as dist
-
 import optuna
+import torch
+from optuna.samplers import TPESampler
+from optuna.storages import JournalRedisStorage, RDBStorage
+from optuna.study.study import create_study
+from timm.data import create_transform
+from transformers import AutoModel
+
 from mamba_clip.data import get_data, get_metadata, get_transform, undersample_data
 from mamba_clip.loss import cross_entropy_loss
-from mamba_clip.model import VSSM
+from mamba_clip.model import VSSM, MambaVisionClassifier
 from mamba_clip.pipeline import (
     init_wandb,
     prepare_params,
@@ -22,15 +25,10 @@ from mamba_clip.pipeline import (
     step,
 )
 from mamba_clip.utils.dist_utils import (
-    broadcast_object,
-    init_device,
-    is_master,
     world_info_from_env,
 )
+from mamba_clip.utils.generic_utils import random_seed
 from mamba_clip.utils.logging import get_logger, logger_setup
-from optuna.samplers import TPESampler
-from optuna.storages import JournalRedisStorage, RDBStorage
-from optuna.study.study import create_study
 
 try:
     from optuna.storages import RedisStorage  # optuna<=3.0.0
@@ -40,15 +38,17 @@ except ImportError:
     try:
         from optuna.storages import (
             JournalRedisStorage,  # optuna>=3.1.0,<4.0.0
+        )
+        from optuna.storages import (
             JournalStorage as RedisStorage,
         )
 
     except ImportError:
         try:
+            from optuna.storages import JournalStorage as RedisStorage
             from optuna.storages.journal import (
                 JournalRedisBackend as JournalRedisStorage,
             )
-            from optuna.storages import JournalStorage as RedisStorage
 
         except ImportError:
             RedisStorage = None
@@ -75,7 +75,15 @@ def load_data(args):
 
 
 def setup(args, data, device):
-    model = VSSM(depths=[2, 2, 8, 2], dims=[64, 128, 256, 512], num_classes=2)
+    if args.model is None or args.model == "VSSM":
+        model = VSSM(depths=[2, 2, 8, 2], dims=[64, 128, 256, 512], num_classes=2)
+    elif isinstance(args.model, str):
+        model = AutoModel.from_pretrained(args.model)
+        if "mamba" in args.model.lower():
+            model = MambaVisionClassifier(model, num_classes=2)
+    else:
+        raise ValueError("Model not recognized")
+
     model = model.to(device)
     params, args = prepare_params(model, data, device, args)
     if isinstance(args.class_weighted_loss, (np.ndarray, list, tuple, torch.Tensor)):
@@ -134,23 +142,62 @@ def optimize(trial: optuna.Trial, data, args) -> dict[str, Any]:
 
     params_file = os.path.join(new_args.logs, new_args.name, "params.txt")
     new_args, params = setup(new_args, data, device)
+    if (
+        hasattr(params["model"], "config")
+        and hasattr(params["model"].config, "mean")
+        and hasattr(params["model"].config, "std")
+        and hasattr(params["model"].config, "crop")
+        and hasattr(params["model"].config, "crop_pct")
+    ):
+        input_resolution = (3, 224, 224)
+        preprocess_train = create_transform(
+            input_size=input_resolution,
+            is_training=True,
+            mean=params["model"].config.mean,
+            std=params["model"].config.std,
+            crop_mode=params["model"].config.crop,
+            crop_pct=params["model"].config.crop_pct,
+        )
+        preprocess_val = create_transform(
+            input_size=input_resolution,
+            is_training=False,
+            mean=params["model"].config.mean,
+            std=params["model"].config.std,
+            crop_mode=params["model"].config.crop,
+            crop_pct=params["model"].config.crop_pct,
+        )
+
     if new_args.wandb:
         init_wandb(new_args, data, params["model"], params_file)
 
-    metrics = step(
-        data=data,
-        loss=params["loss"],
-        model=params["model"],
-        original_model=params["original_model"],
-        tokenizer=params.get("tokenizer", None),
-        optimizer=params["optimizer"],
-        scaler=params["scaler"],
-        scheduler=params["scheduler"],
-        start_epoch=params["start_epoch"],
-        writer=params.get("writer", None),
-        args=new_args,
-        save_prefix=f"stage_{new_args.stage}_",
-    )
+    try:
+        metrics = step(
+            data=data,
+            loss=params["loss"],
+            model=params["model"],
+            original_model=params["original_model"],
+            tokenizer=params.get("tokenizer", None),
+            optimizer=params["optimizer"],
+            scaler=params["scaler"],
+            scheduler=params["scheduler"],
+            start_epoch=params["start_epoch"],
+            writer=params.get("writer", None),
+            args=new_args,
+            save_prefix=f"stage_{new_args.stage}_",
+        )
+    except ValueError as e:
+        # check if it was because input contains NaN
+        if "input contains nan" in str(e).lower():
+            metrics = {
+                "train_loss": float("inf"),
+                "val_loss": float("inf"),
+                "auc": 0,
+                "partial_auc": 0,
+                "acc": 0,
+            }
+        else:
+            raise e
+
     # if args.distributed:
     #     dist.barrier()
     #     dist.destroy_process_group()

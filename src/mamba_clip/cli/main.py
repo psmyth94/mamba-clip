@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Type, Union
 
 from mamba_clip.pipeline import pipeline
-from mamba_clip.utils.logging import logger_setup
 
 
 @dataclass
@@ -47,9 +46,11 @@ class Args:
     resume: Optional[str] = None
     precision: str = "amp"
     stage: int = 1
-    model_stage_1: Union[Type, str] = (
-        "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
-    )
+    model: Optional[str] = None
+    model_stage_1: Optional[Union[Type, str]] = None
+    # model_stage_1: Union[Type, str] = (
+    #     "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+    # )
     model_stage_2: Optional[Union[Type, str]] = None
     use_inner_prod: bool = False
     use_visual_only: bool = False
@@ -252,10 +253,10 @@ def arg_parser():
         "--precision", type=str, default="amp", help="Precision for training"
     )
     parser.add_argument("--stage", type=int, default=1, help="Training stage")
+    parser.add_argument("--model", type=str, help="Model to use")
     parser.add_argument(
         "--model-stage-1",
         type=str,
-        default="microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224",
         help="Model for stage 1",
     )
     parser.add_argument(
