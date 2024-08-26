@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from sklearn.metrics import auc, roc_curve
+from transformers.modeling_outputs import ModelOutput
 
 from .utils import get_autocast, get_input_dtype, is_master, logging
 
@@ -115,6 +116,8 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
                         ) / 2
                     else:
                         logits = model_out
+                        if isinstance(logits, ModelOutput):
+                            logits = logits.logits
                         total_loss = F.cross_entropy(logits, targets)
                         probs = F.softmax(logits, dim=1)
                         if probs.shape[1] == 1:

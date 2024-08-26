@@ -67,18 +67,19 @@ def init_wandb(args, data, model, params_file):
 
 def setup_paths(args, trial_id=None):
     # get the name of the experiments
-    if args.stage == 1:
-        args.model = (
-            args.model_stage_1
-            if isinstance(args.model_stage_1, str)
-            else args.model_stage_1.__name__
-        )
-    elif args.stage == 2:
-        args.model = (
-            args.model_stage_2
-            if isinstance(args.model_stage_2, str)
-            else args.model_stage_2.__name__
-        )
+    if args.model is None:
+        if args.stage == 1:
+            args.model = (
+                args.model_stage_1
+                if isinstance(args.model_stage_1, str)
+                else args.model_stage_1
+            )
+        elif args.stage == 2:
+            args.model = (
+                args.model_stage_2
+                if isinstance(args.model_stage_2, str)
+                else args.model_stage_2.__name__
+            )
     if args.name is None:
         args.name = create_log_path(args, args.model, trial_id=trial_id)
     elif trial_id is not None:

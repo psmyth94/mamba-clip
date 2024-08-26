@@ -182,7 +182,9 @@ def train_one_epoch(
                 if balanced_texts is not None:
                     del balanced_texts
                 model_out = model(*input)
-                if not isinstance(model_out, dict):
+                if isinstance(model_out, dict) and "logits" in model_out:
+                    model_out = {"input": model_out["logits"]}
+                elif not isinstance(model_out, dict):
                     model_out = {"input": model_out}
                 losses = loss(**model_out, target=targets)
 
@@ -213,7 +215,10 @@ def train_one_epoch(
                     if balanced_texts is not None:
                         del balanced_texts
                     model_out = model(*input)
-                    if not isinstance(model_out, dict):
+
+                    if isinstance(model_out, dict) and "logits" in model_out:
+                        model_out = {"input": model_out["logits"]}
+                    elif not isinstance(model_out, dict):
                         model_out = {"input": model_out}
 
                     for f in ("logit_scale", "logit_bias"):

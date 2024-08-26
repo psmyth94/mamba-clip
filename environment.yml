@@ -9,20 +9,25 @@ dependencies:
   - cuda-toolkit
   - cuda-compiler
   - pytorch-cuda=11.8
+  - cudatoolkit=11.8
+  - xclip
+  - git
+  - nodejs
   - pytorch
   - torchvision
-  - cudatoolkit=11.8
   - pip
   - pip:
+    # - mambavision
+    - optuna
+    - ray[tune]
+    - redis
     - scikit-learn
     - h5py
     - tqdm
     - pandas
-    - mamba-ssm
     - ftfy
     - regex
     - fsspec
-    - timm>=1.0.7
     - huggingface_hub
     - transformers[sentencepiece]
     - braceexpand

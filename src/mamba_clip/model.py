@@ -1213,12 +1213,12 @@ class MambaVisionClassifier(torch.nn.Module):
         dropout=0.1,
     ):
         super().__init__()
-        self.model = unwrap_model(model)
+        self.config = unwrap_model(model).config
+        self.model = unwrap_model(model).model
         self.num_classes = num_classes
-        self.config = self.model.config
 
         feature_dim = int(
-            self.model.config.dim * 2 ** (len(self.model.config.depths) - 1)
+            self.config.dim * 2 ** (len(self.config.depths) - 1)
         )
 
         self.fc = torch.nn.Sequential(
@@ -1227,7 +1227,7 @@ class MambaVisionClassifier(torch.nn.Module):
         )
 
     def forward(self, image, *args, **kwargs):
-        out = self.model(image)
+        out = self.model.forward_features(image)
         if isinstance(out, tuple):
             out = out[0]
         elif isinstance(out, dict):

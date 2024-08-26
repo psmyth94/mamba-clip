@@ -116,6 +116,8 @@ class Args:
     world_size: int = 1
     tensorboard: bool = False
     wandb: bool = False
+    return_best: bool = False
+    hopt_direction: str = "minimize"
 
 
 def arg_parser():
@@ -257,6 +259,7 @@ def arg_parser():
     parser.add_argument(
         "--model-stage-1",
         type=str,
+        default="microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224",
         help="Model for stage 1",
     )
     parser.add_argument(

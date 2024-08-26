@@ -1,34 +1,39 @@
 # type: ignore
 import copy
 import os
+import time
 from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import joblib
 import numpy as np
-import optuna
 import torch
-from optuna.samplers import TPESampler
-from optuna.storages import JournalRedisStorage, RDBStorage
-from optuna.study.study import create_study
 from timm.data import create_transform
-from transformers import AutoModel
+from transformers import AutoModel, AutoModelForImageClassification
+from transformers.models.efficientnet.image_processing_efficientnet import (
+    EfficientNetImageProcessor,
+)
 
+import optuna
 from mamba_clip.data import get_data, get_metadata, get_transform, undersample_data
 from mamba_clip.loss import cross_entropy_loss
 from mamba_clip.model import VSSM, MambaVisionClassifier
 from mamba_clip.pipeline import (
-    init_wandb,
     prepare_params,
     setup_paths,
     setup_train,
     step,
 )
 from mamba_clip.utils.dist_utils import (
+    is_master,
     world_info_from_env,
 )
 from mamba_clip.utils.generic_utils import random_seed
 from mamba_clip.utils.logging import get_logger, logger_setup
+from optuna.integration.wandb import WeightsAndBiasesCallback
+from optuna.samplers import TPESampler
+from optuna.storages import JournalRedisStorage, RDBStorage
+from optuna.study.study import create_study
 
 try:
     from optuna.storages import RedisStorage  # optuna<=3.0.0
@@ -64,6 +69,9 @@ try:
 except ImportError:
     tensorboard = None
 
+if TYPE_CHECKING:
+    from mamba_clip.cli.main import Args
+
 logger = get_logger(__name__)
 
 
@@ -78,9 +86,16 @@ def setup(args, data, device):
     if args.model is None or args.model == "VSSM":
         model = VSSM(depths=[2, 2, 8, 2], dims=[64, 128, 256, 512], num_classes=2)
     elif isinstance(args.model, str):
-        model = AutoModel.from_pretrained(args.model)
+        model = AutoModel.from_pretrained(args.model, trust_remote_code=True)
         if "mamba" in args.model.lower():
             model = MambaVisionClassifier(model, num_classes=2)
+        else:
+            model = AutoModelForImageClassification.from_pretrained(
+                args.model,
+                trust_remote_code=True,
+                num_labels=2,
+                ignore_mismatched_sizes=True,
+            )
     else:
         raise ValueError("Model not recognized")
 
@@ -99,7 +114,7 @@ def setup(args, data, device):
     return args, params
 
 
-def optimize(trial: optuna.Trial, data, args) -> dict[str, Any]:
+def optimize(trial: optuna.Trial, data, args: "Args") -> dict[str, Any]:
     new_args = copy.deepcopy(args)
     train_metadata, val_metadata, preprocess_train, preprocess_val = data
     new_args.device = (
@@ -119,7 +134,8 @@ def optimize(trial: optuna.Trial, data, args) -> dict[str, Any]:
         preprocess_train=preprocess_train,
         preprocess_val=preprocess_val,
     )
-    new_args.epochs = trial.suggest_int("epochs", 1, 5)
+    new_args.epochs = 6
+    new_args.return_best = True
     new_args.lr = trial.suggest_float("lr", 1e-6, 1e-3, log=True)
     new_args.beta1 = trial.suggest_float("beta1", 0.9, 0.999)
     new_args.beta2 = trial.suggest_float("beta2", 0.9, 0.999)
@@ -140,9 +156,24 @@ def optimize(trial: optuna.Trial, data, args) -> dict[str, Any]:
     new_args = setup_paths(new_args, trial_id=trial.number)
     new_args = setup_train(new_args, checkpoint_prefix=f"stage_{new_args.stage}_")
 
-    params_file = os.path.join(new_args.logs, new_args.name, "params.txt")
     new_args, params = setup(new_args, data, device)
-    if (
+    if "efficientnet" in new_args.model.lower():
+        preprocess_val = EfficientNetImageProcessor.from_pretrained(
+            args.model, trust_remote_code=True
+        )
+        image_size = (3, preprocess_val.size["height"], preprocess_val.size["width"])
+        crop_pct = preprocess_val.crop_size["height"] / preprocess_val.size["height"]
+        preprocess_train = create_transform(
+            input_size=image_size,
+            is_training=True,
+            mean=preprocess_val.image_mean,
+            std=preprocess_val.image_std,
+            crop_mode="rrc",
+            crop_pct=crop_pct,
+            normalize=preprocess_val.do_normalize,
+        )
+
+    elif (
         hasattr(params["model"], "config")
         and hasattr(params["model"].config, "mean")
         and hasattr(params["model"].config, "std")
@@ -167,9 +198,6 @@ def optimize(trial: optuna.Trial, data, args) -> dict[str, Any]:
             crop_pct=params["model"].config.crop_pct,
         )
 
-    if new_args.wandb:
-        init_wandb(new_args, data, params["model"], params_file)
-
     try:
         metrics = step(
             data=data,
@@ -185,6 +213,7 @@ def optimize(trial: optuna.Trial, data, args) -> dict[str, Any]:
             args=new_args,
             save_prefix=f"stage_{new_args.stage}_",
         )
+
     except ValueError as e:
         # check if it was because input contains NaN
         if "input contains nan" in str(e).lower():
@@ -205,12 +234,12 @@ def optimize(trial: optuna.Trial, data, args) -> dict[str, Any]:
     return metrics[new_args.eval_loss]
 
 
-def optuna_pipeline(args):
+def optuna_pipeline(args: "Args"):
     if args.eval_loss is None:
         args.eval_loss = "val_loss"
-        mode = "mininimize"
+        args.hopt_direction = "mininimize"
     elif args.eval_loss in ["partial_auc", "auc", "acc"]:
-        mode = "maximize"
+        args.hopt_direction = "maximize"
 
     args.log_local = True
 
@@ -223,34 +252,59 @@ def optuna_pipeline(args):
     args.seed = args.seed + args.rank
     sampler = TPESampler(seed=args.seed, multivariate=True)
     random_seed(args.seed)
-    if args.optuna_study_name is not None:
-        storage = None
-        if args.optuna_storage is not None:
-            if args.optuna_storage.startswith("redis"):
-                if JournalRedisStorage is not None:
-                    storage = RedisStorage(JournalRedisStorage(url=args.optuna_storage))
-                else:
-                    storage = RedisStorage(url=args.optuna_storage)
+    if not is_master(args):
+        logger.info("Waiting for head node to finish creating study...")
+        time.sleep(10)
+    if args.optuna_study_name is None:
+        args.optuna_study_name = "AutoTrain"
+    logger.info(
+        f"Optimizing study {args.optuna_study_name} "
+        f"(eval: {args.eval_loss}; mode: {args.hopt_direction})"
+    )
+    storage = None
+    if args.optuna_storage is not None:
+        if args.optuna_storage.startswith("redis"):
+            if JournalRedisStorage is not None:
+                storage = RedisStorage(JournalRedisStorage(url=args.optuna_storage))
             else:
-                storage = RDBStorage(url=args.optuna_storage)
-        study = create_study(
-            direction=mode,
-            study_name=args.optuna_study_name,
-            sampler=sampler,
-            storage=storage,
-            load_if_exists=True,
+                storage = RedisStorage(url=args.optuna_storage)
+        else:
+            storage = RDBStorage(url=args.optuna_storage)
+    if args.report_to == "wandb":
+        if wandb is None:
+            raise ImportError("wandb is not installed")
+        args.train_sz = len(metadata[0])
+        args.val_sz = len(metadata[1])
+        if args.name is not None:
+            args.name = f"{args.name}_{args.rank}"
+        wandb_kwargs = dict(
+            project=args.wandb_project_name or "mamba-clip",
+            name=args.name or f"AutoTrain{args.rank}",
+            id=args.name or f"AutoTrain{args.rank}",
+            notes=args.wandb_notes,
+            tags=[],
+            resume="auto" if args.resume == "latest" else None,
+            config=vars(args),
         )
+        args.report_to = ""
+        wandbcb = WeightsAndBiasesCallback(wandb_kwargs=wandb_kwargs)
+
+        @wandbcb.track_in_wandb()
+        def objective(trial):
+            return optimize(trial, metadata, args)
     else:
-        study = create_study(
-            direction=mode, study_name="AutoTrain", sampler=sampler, load_if_exists=True
-        )
+        objective = partial(optimize, data=metadata, args=args)
+
+    study = create_study(
+        direction=args.hopt_direction,
+        study_name=args.optuna_study_name,
+        sampler=sampler,
+        storage=storage,
+        load_if_exists=True,
+    )
 
     study.optimize(
-        lambda trial: optimize(
-            trial,
-            data=metadata,
-            args=args,
-        ),
+        objective,
         n_trials=args.training_iterations,
     )
 
