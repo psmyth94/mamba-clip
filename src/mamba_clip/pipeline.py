@@ -462,7 +462,7 @@ def step(
         completed_epoch = epoch + 1
 
         if any(v in data for v in ("val", "imagenet-val", "imagenet-v2")):
-            metrics = evaluate(
+            _metrics = evaluate(
                 model,
                 data,
                 completed_epoch,
@@ -470,6 +470,19 @@ def step(
                 tb_writer=writer,
                 tokenizer=tokenizer,
             )
+            if args.return_best and args.eval_loss:
+                if "min" in args.hopt_direction and (
+                    metrics is None
+                    or _metrics[args.eval_loss] < metrics[args.eval_loss]
+                ):
+                    metrics = _metrics
+                elif "max" in args.hopt_direction and (
+                    metrics is None
+                    or _metrics[args.eval_loss] > metrics[args.eval_loss]
+                ):
+                    metrics = _metrics
+            else:
+                metrics = _metrics
 
         # Saving checkpoints.
         if args.save_logs:
